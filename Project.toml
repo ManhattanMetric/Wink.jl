@@ -1,0 +1,21 @@
+name = "Wink"
+uuid = "9541d238-a10b-4915-97cf-11ce6d18e9b8"
+authors = ["Josh Ballanco <josh.ballanco@manhattanmetric.com> and contributors"]
+version = "1.0.0-DEV"
+
+[deps]
+Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
+NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+
+[compat]
+julia = "1.12"
+Functors = "0.5"
+NPZ = "0.4"
+PythonCall = "0.9"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
