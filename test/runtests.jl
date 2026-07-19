@@ -17,4 +17,6 @@ using TestPkg
     include("test_introspect.jl")
     include("test_tools.jl")
     include("test_config.jl")
+    include("test_eval.jl")
+    include("test_agent.jl")
 end

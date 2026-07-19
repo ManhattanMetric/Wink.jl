@@ -1,0 +1,108 @@
+# Agent-loop tests against PromptingTools' TestEcho mock schemas — no network.
+# The echo schema replays the same canned response on every call and records
+# the *rendered* payload in `.inputs`, which lets us regression-test the
+# flattening workaround for PT's Anthropic renderer dropping tool messages.
+
+# NOTE: the content vector must be eltype Dict{Symbol,Any} (like real parsed
+# JSON). With an overly-concrete eltype, PT's tools_array comprehension infers
+# `Union{}` for empty results and its AIToolRequest construction TypeErrors.
+anthropic_text_response(text) = Dict{Symbol, Any}(
+    :content => Dict{Symbol, Any}[Dict{Symbol, Any}(:type => "text", :text => text)],
+    :stop_reason => "end_turn",
+    :usage => Dict{Symbol, Any}(:input_tokens => 10, :output_tokens => 4))
+
+anthropic_tool_response(name, input) = Dict{Symbol, Any}(
+    :content => Dict{Symbol, Any}[Dict{Symbol, Any}(:type => "tool_use",
+        :id => "toolu_1", :name => name, :input => input)],
+    :stop_reason => "tool_use",
+    :usage => Dict{Symbol, Any}(:input_tokens => 7, :output_tokens => 3))
+
+@testset "agent" begin
+    # --- plain text turn ---
+    schema = PT.TestEchoAnthropicSchema(;
+        response = anthropic_text_response("All good."), status = 200)
+    chat = Wink.new_chat()
+    ans = Wink.run_turn!(chat, "hello?"; schema, io = devnull)
+    @test ans == "All good."
+    @test chat.history[end] isa PT.AIMessage
+    @test chat.tokens_in == 10
+    @test chat.tokens_out == 4
+
+    # --- tool-call turns ---
+    # The echo always answers with the same tool_use, so the loop runs to the
+    # round cap, executes the (real) tool each round, then forces a final call.
+    schema2 = PT.TestEchoAnthropicSchema(;
+        response = anthropic_tool_response("get_doc",
+            Dict{Symbol, Any}(:name => "TestPkg.greet")),
+        status = 200)
+    old_rounds = Wink.CONFIG.max_rounds
+    chat2 = Wink.new_chat()
+    try
+        Wink.CONFIG.max_rounds = 2
+        ans2 = Wink.run_turn!(chat2, "docs for greet?"; schema = schema2, io = devnull)
+        @test ans2 == ""   # forced-final echo is another tool_use; content is empty
+    finally
+        Wink.CONFIG.max_rounds = old_rounds
+    end
+    users = [m for m in chat2.history if m isa PT.UserMessage]
+    ais = [m for m in chat2.history if m isa PT.AIMessage]
+    # tool results were flattened into plain user text...
+    @test any(m -> occursin("<tool_result name=\"get_doc\">", m.content), users)
+    # ...and the real get_doc tool actually ran
+    @test any(m -> occursin("friendly", m.content), users)
+    # the assistant turn records the flattened call description
+    @test any(m -> occursin("get_doc", m.content), ais)
+    # round-cap wrap-up message was appended
+    @test any(m -> occursin("Tool budget exhausted", m.content), users)
+    # REGRESSION (renderer gap): the mock recorded the rendered payload; the
+    # flattened tool result must appear there as an ordinary rendered message
+    @test occursin("tool_result", string(schema2.inputs))
+
+    # --- gated tool: denial feeds DECLINED back into the conversation ---
+    schema3 = PT.TestEchoAnthropicSchema(;
+        response = anthropic_tool_response("eval_code", Dict{Symbol, Any}(:code => "1+1")),
+        status = 200)
+    old_confirm = Wink.CONFIG.confirm
+    chat3 = Wink.new_chat()
+    try
+        Wink.CONFIG.autoeval = false
+        Wink.CONFIG.confirm = (k, t) -> false
+        Wink.CONFIG.max_rounds = 1
+        Wink.run_turn!(chat3, "run 1+1"; schema = schema3, io = devnull)
+    finally
+        Wink.CONFIG.confirm = old_confirm
+        Wink.CONFIG.max_rounds = old_rounds
+    end
+    @test any(m -> m isa PT.UserMessage && occursin("DECLINED", m.content),
+        chat3.history)
+
+    # --- gated tool: approval executes in the real Main ---
+    schema4 = PT.TestEchoAnthropicSchema(;
+        response = anthropic_tool_response("eval_code",
+            Dict{Symbol, Any}(:code => "WINK_AGENT_SENTINEL = 41 + 1")),
+        status = 200)
+    chat4 = Wink.new_chat()
+    try
+        Wink.CONFIG.confirm = (k, t) -> true
+        Wink.CONFIG.max_rounds = 1
+        Wink.run_turn!(chat4, "set the sentinel"; schema = schema4, io = devnull)
+    finally
+        Wink.CONFIG.confirm = old_confirm
+        Wink.CONFIG.max_rounds = old_rounds
+    end
+    @test Main.WINK_AGENT_SENTINEL == 42
+
+    # --- system prompt content ---
+    sp = Wink.system_prompt()
+    @test occursin(string(VERSION), sp)
+    @test occursin("ground truth", sp)
+    @test occursin("TestPkg", sp)   # loaded-module summary
+
+    # --- global chat plumbing ---
+    Wink.reset!()
+    @test Wink.CHAT[] === nothing
+    c = Wink.current_chat()
+    @test c isa Wink.Chat
+    @test Wink.CHAT[] === c
+    Wink.reset!()
+end

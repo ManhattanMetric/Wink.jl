@@ -29,8 +29,10 @@ include("config.jl")
 include("resolve.jl")
 include("introspect.jl")
 include("tools.jl")
+include("evalengine.jl")
+include("agent.jl")
 
-export configure!, autoeval!
+export configure!, autoeval!, ask, reset!
 
 function __init__()
     try
