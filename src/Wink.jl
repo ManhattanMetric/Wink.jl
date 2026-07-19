@@ -30,6 +30,7 @@ include("resolve.jl")
 include("introspect.jl")
 include("tools.jl")
 include("evalengine.jl")
+include("edit.jl")
 include("agent.jl")
 include("repl.jl")
 

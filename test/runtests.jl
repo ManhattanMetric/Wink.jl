@@ -20,4 +20,5 @@ using TestPkg
     include("test_eval.jl")
     include("test_agent.jl")
     include("test_repl.jl")
+    include("test_edit.jl")
 end
