@@ -110,11 +110,7 @@ function handle_meta_command(cmd::AbstractString; io::IO = stdout)
             println(io, "current chat model: ", CONFIG.chat_model)
         end
     elseif head == ":reindex"
-        if isdefined(Wink, :reindex!)
-            Base.invokelatest(getglobal(Wink, :reindex!))
-        else
-            println(io, "doc indexing is not available in this build")
-        end
+        reindex!()
     else
         println(io, "unknown command ", head, " — try :help")
     end

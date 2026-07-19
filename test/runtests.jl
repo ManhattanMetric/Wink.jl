@@ -21,4 +21,5 @@ using TestPkg
     include("test_agent.jl")
     include("test_repl.jl")
     include("test_edit.jl")
+    include("test_rag.jl")
 end
