@@ -54,6 +54,20 @@ Wink.autoeval!(true)
 Wink.reset!()
 ```
 
+## Philosophy: grow the language, don't dump code
+
+Wink is prompted to work the way Lisp programmers always have and Julia makes
+natural: bottom-up, growing a vocabulary of abstractions until the program
+reads like the domain. Ask for a blog engine and it should not emit a wall of
+low-level Julia and HTML — it should help you name the layers
+(`display_blog_post` composed of `render_markdown`, and once you ask for
+comments, `display_comments`), defining and demonstrating each piece live in
+your session so you can review and own every level. It is equally steered
+*away* from the opposite failure: speculative type hierarchies and macros
+where a function would do ("the weakest tool that works"). Standing
+instructions (see [Configuration](configuration.md)) can push this default
+further, or in a different direction, per project.
+
 ## How a turn works
 
 Each `ai>` message runs an agentic loop: the model receives your message plus

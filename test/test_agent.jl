@@ -97,6 +97,8 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     @test occursin(string(VERSION), sp)
     @test occursin("ground truth", sp)
     @test occursin("TestPkg", sp)   # loaded-module summary
+    @test occursin("vocabulary of abstractions", sp)
+    @test occursin("weakest tool", sp)
 
     # --- global chat plumbing ---
     Wink.reset!()
