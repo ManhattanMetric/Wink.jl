@@ -40,6 +40,39 @@ the common cases. Settings are not persisted across sessions; put a
 for durable preferences, or use PromptingTools' own preference system for API
 keys and default models.
 
+## Steering Wink with standing instructions
+
+Wink's system prompt has a fixed core (session facts plus ground rules like
+"never recite source from memory — call `get_source`"), and on top of it you
+can layer your own standing instructions to point the model in a specific
+direction. Three layers compose, most global first:
+
+1. **Global** — `~/.julia/config/wink.md`, applied in every session.
+2. **Per-project** — a `.wink.md` (or `WINK.md`) next to the active project's
+   `Project.toml`. This is the place for project conventions.
+3. **Session** — `Wink.configure!(instructions = "...")`, for ad-hoc steering.
+
+Where layers conflict, later (more specific) ones win. None of them can
+override the confirmation gates.
+
+Examples of what goes in these files:
+
+```markdown
+# ~/.julia/config/wink.md — who you're helping
+I'm comfortable with Julia but new to its performance model. When you touch
+performance, show the `warntype` evidence and explain what it means.
+
+# .wink.md — project conventions
+This package follows BlueStyle. Tests use plain @testset (no snapshot
+frameworks). Prefer explaining a fix before applying it; we favor small,
+reviewable edits over rewrites.
+```
+
+Inspect exactly what the model is told with `:prompt` in `ai>` mode. Prompt
+changes (any layer) take effect when the next conversation starts — `:reset`
+or [`reset!`](@ref); the files are re-read at that point, so editing `.wink.md`
+mid-session is fine.
+
 ## The documentation index
 
 `search_docs` builds its embedding index lazily on first use and caches it in

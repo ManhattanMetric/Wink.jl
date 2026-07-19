@@ -38,6 +38,9 @@
     Wink.handle_meta_command(":history"; io = buf)
     @test occursin("no conversation", String(take!(buf)))
 
+    Wink.handle_meta_command(":prompt"; io = buf)
+    @test occursin("Session facts", String(take!(buf)))
+
     Wink.print_answer("**bold** and `code`"; io = buf)
     @test !isempty(String(take!(buf)))
     Wink.print_answer(""; io = buf)

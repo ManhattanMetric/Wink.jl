@@ -106,3 +106,54 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     @test Wink.CHAT[] === c
     Wink.reset!()
 end
+
+@testset "standing instructions" begin
+    old_instr = Wink.CONFIG.instructions
+    old_global = Wink.GLOBAL_INSTRUCTIONS_FILE[]
+    try
+        # no layers configured -> no section at all
+        Wink.CONFIG.instructions = ""
+        Wink.GLOBAL_INSTRUCTIONS_FILE[] = joinpath(mktempdir(), "absent.md")
+        @test !occursin("Standing instructions", Wink.system_prompt())
+
+        # session layer (configure!)
+        Wink.configure!(instructions = "Always explain type-stability implications.")
+        sp = Wink.system_prompt()
+        @test occursin("Standing instructions", sp)
+        @test occursin("Session instructions", sp)
+        @test occursin("type-stability implications", sp)
+
+        # global-file layer (via the test hook)
+        Wink.CONFIG.instructions = ""
+        mktempdir() do dir
+            gf = joinpath(dir, "wink.md")
+            write(gf, "Prefer StaticArrays for small fixed-size data.")
+            Wink.GLOBAL_INSTRUCTIONS_FILE[] = gf
+            sp = Wink.system_prompt()
+            @test occursin("Global instructions", sp)
+            @test occursin("StaticArrays", sp)
+
+            # oversized files are truncated, not dumped wholesale
+            write(gf, repeat("x", 20_000))
+            @test occursin("[instructions truncated]", Wink.system_prompt())
+        end
+        Wink.GLOBAL_INSTRUCTIONS_FILE[] = joinpath(mktempdir(), "absent.md")
+
+        # project layer (.wink.md next to the active Project.toml)
+        proj = Base.active_project()
+        if proj !== nothing
+            pf = joinpath(dirname(proj), ".wink.md")
+            write(pf, "This project uses BlueStyle formatting.")
+            try
+                sp = Wink.system_prompt()
+                @test occursin("Project instructions", sp)
+                @test occursin("BlueStyle", sp)
+            finally
+                rm(pf; force = true)
+            end
+        end
+    finally
+        Wink.CONFIG.instructions = old_instr
+        Wink.GLOBAL_INSTRUCTIONS_FILE[] = old_global
+    end
+end

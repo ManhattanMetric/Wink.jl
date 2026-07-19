@@ -40,6 +40,7 @@ Base.@kwdef mutable struct WinkConfig
     max_tokens::Int = 8192
     tool_output_limit::Int = 4_000
     status_io::IO = stderr
+    instructions::String = ""           # session-level standing instructions
 end
 
 const CONFIG = WinkConfig()
@@ -81,19 +82,25 @@ function detect_providers!(cfg::WinkConfig = CONFIG)
 end
 
 """
-    configure!(; chat_model, chat_schema, embed_model, embed_schema,
-                 autoeval, max_rounds, max_tokens, tool_output_limit) -> WinkConfig
+    configure!(; chat_model, chat_schema, embed_model, embed_schema, autoeval,
+                 max_rounds, max_tokens, tool_output_limit, instructions) -> WinkConfig
 
 Override Wink's configuration. Model names unknown to PromptingTools' registry
 are registered when the matching `*_schema` is supplied (e.g.
 `configure!(chat_model = "my-model", chat_schema = PromptingTools.OllamaSchema())`);
 without a schema an unknown name would route to the default (OpenAI) provider,
 so a warning is emitted.
+
+`instructions` sets session-level standing instructions for the model — they
+are appended to the system prompt alongside any global
+(`~/.julia/config/wink.md`) and per-project (`.wink.md`) instruction files.
+Prompt changes take effect when the next conversation starts (`Wink.reset!()`
+or `:reset`).
 """
 function configure!(; chat_model = nothing, chat_schema = nothing,
         embed_model = nothing, embed_schema = nothing,
         autoeval = nothing, max_rounds = nothing, max_tokens = nothing,
-        tool_output_limit = nothing)
+        tool_output_limit = nothing, instructions = nothing)
     if chat_model !== nothing
         _adopt_model!(chat_model, chat_schema, "chat_model")
         CONFIG.chat_model = String(chat_model)
@@ -106,6 +113,7 @@ function configure!(; chat_model = nothing, chat_schema = nothing,
     max_rounds === nothing || (CONFIG.max_rounds = Int(max_rounds))
     max_tokens === nothing || (CONFIG.max_tokens = Int(max_tokens))
     tool_output_limit === nothing || (CONFIG.tool_output_limit = Int(tool_output_limit))
+    instructions === nothing || (CONFIG.instructions = String(instructions))
     return CONFIG
 end
 

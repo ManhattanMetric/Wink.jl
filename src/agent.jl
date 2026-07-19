@@ -58,6 +58,60 @@ function loaded_module_summary()
            "\n- Loaded stdlibs: " * (isempty(stdlib) ? "(none)" : join(stdlib, ", "))
 end
 
+# ---- standing instructions ---------------------------------------------------
+#
+# Three user-steerable layers, composed into the system prompt (most global
+# first, most specific last): a global file, a per-project file at the active
+# project root, and the runtime `CONFIG.instructions` string. All are optional.
+
+const GLOBAL_INSTRUCTIONS_FILE = Ref(joinpath(homedir(), ".julia", "config", "wink.md"))
+const PROJECT_INSTRUCTIONS_NAMES = (".wink.md", "WINK.md")
+const INSTRUCTIONS_CHAR_LIMIT = 12_000
+
+function project_instructions_file()
+    proj = Base.active_project()
+    proj === nothing && return nothing
+    for name in PROJECT_INSTRUCTIONS_NAMES
+        p = joinpath(dirname(proj), name)
+        isfile(p) && return p
+    end
+    return nothing
+end
+
+function read_instructions(path::AbstractString)
+    s = try
+        String(strip(read(path, String)))
+    catch
+        return ""
+    end
+    length(s) > INSTRUCTIONS_CHAR_LIMIT &&
+        (s = first(s, INSTRUCTIONS_CHAR_LIMIT) * "\n… [instructions truncated]")
+    return s
+end
+
+function user_instructions_block()
+    sections = String[]
+    gf = GLOBAL_INSTRUCTIONS_FILE[]
+    if isfile(gf)
+        t = read_instructions(gf)
+        isempty(t) || push!(sections, "### Global instructions ($gf)\n$t")
+    end
+    pf = project_instructions_file()
+    if pf !== nothing
+        t = read_instructions(pf)
+        isempty(t) || push!(sections, "### Project instructions ($pf)\n$t")
+    end
+    s = strip(CONFIG.instructions)
+    isempty(s) || push!(sections, "### Session instructions (Wink.configure!)\n$s")
+    isempty(sections) && return ""
+    return "\n## Standing instructions from the user\n" *
+           "Follow these — where they conflict, later sections win, and all of " *
+           "them take precedence over the style guidance above. They never " *
+           "override the confirmation gates or the rule that introspection " *
+           "tools are ground truth.\n\n" *
+           join(sections, "\n\n") * "\n"
+end
+
 function system_prompt()
     doc_search = !has_tool("search_docs") ? "list_names (keyword) only" :
                  isempty(CONFIG.embed_model) ?
@@ -68,7 +122,7 @@ function system_prompt()
                 - Before edit_file: call where_defined, then read_file to copy the exact
                   current text for old_string. Never construct an edit from memory.
                 """ : ""
-    return """
+    base = """
     You are Wink, an AI pair-programmer living INSIDE the user's running Julia
     session — not a code generator for some other process. You share the session:
     code you evaluate runs in the user's Main, sees their variables, and persists
@@ -94,6 +148,7 @@ function system_prompt()
     - Be concise. Put code in fenced blocks. When you changed session state, state
       exactly what changed.
     """
+    return base * user_instructions_block()
 end
 
 status(io::IO, s::AbstractString) = printstyled(io, "  ", s, "\n"; color = :light_black)
