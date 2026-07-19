@@ -1,5 +1,7 @@
 using Test
 using Wink
+using PromptingTools
+const PT = PromptingTools
 
 # TestPkg is a tiny documented package fixture used across the suites.
 const FIXTURES = joinpath(@__DIR__, "fixtures")
@@ -11,4 +13,8 @@ using TestPkg
         @test Wink isa Module
         @test TestPkg.greet("Wink") == "Hello, Wink!"
     end
+    include("test_resolve.jl")
+    include("test_introspect.jl")
+    include("test_tools.jl")
+    include("test_config.jl")
 end

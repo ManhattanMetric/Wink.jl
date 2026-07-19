@@ -25,8 +25,25 @@ using Markdown
 using REPL
 using InteractiveUtils
 
-# Implementation lands in milestone order (see docs):
-#   config.jl -> resolve.jl -> introspect.jl -> tools.jl -> evalengine.jl
-#   -> agent.jl -> repl.jl -> edit.jl -> rag.jl
+include("config.jl")
+include("resolve.jl")
+include("introspect.jl")
+include("tools.jl")
+
+export configure!, autoeval!
+
+function __init__()
+    try
+        PT.load_api_keys!()
+    catch e
+        @debug "Wink: could not refresh API keys" exception = e
+    end
+    try
+        detect_providers!(CONFIG)
+    catch e
+        @debug "Wink: provider auto-detection failed" exception = e
+    end
+    return nothing
+end
 
 end # module Wink
