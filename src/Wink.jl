@@ -31,6 +31,7 @@ include("introspect.jl")
 include("tools.jl")
 include("evalengine.jl")
 include("agent.jl")
+include("repl.jl")
 
 export configure!, autoeval!, ask, reset!
 
@@ -44,6 +45,29 @@ function __init__()
         detect_providers!(CONFIG)
     catch e
         @debug "Wink: provider auto-detection failed" exception = e
+    end
+    if isinteractive()
+        if isdefined(Base, :active_repl) && Base.active_repl !== nothing
+            # `using Wink` typed at a live prompt
+            try
+                init_repl()
+            catch e
+                @debug "Wink: could not initialize the ai> REPL mode" exception = e
+            end
+        else
+            # loaded from startup.jl — the REPL doesn't exist yet
+            atreplinit() do repl
+                try
+                    if repl isa REPL.LineEditREPL
+                        isdefined(repl, :interface) ||
+                            (repl.interface = REPL.setup_interface(repl))
+                        init_repl(; repl)
+                    end
+                catch e
+                    @debug "Wink: could not initialize the ai> REPL mode" exception = e
+                end
+            end
+        end
     end
     return nothing
 end
