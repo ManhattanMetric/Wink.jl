@@ -27,5 +27,34 @@ Wink is provider-agnostic via
 auto-detects Anthropic (Claude), OpenAI, or a local Ollama server from your
 environment.
 
+## Quickstart
+
+```julia
+pkg> dev https://github.com/ManhattanMetric/Wink.jl    # not yet registered
+
+julia> using Wink
+[Wink] AI mode ready — press ')' at an empty julia> prompt. Chat model: claude-opus-4-8; ...
+
+ai> why is my simulate function slow for Float32 inputs?
+  … thinking (claude-opus-4-8)
+  → list_methods(signature="simulate") [0.1s]
+  → get_ir(signature="simulate(::Vector{Float32})", level="warntype") [0.8s]
+Your `simulate` hits a type instability: ...
+
+ai> fix it
+--- proposed edit ---
+src/model.jl (line 42):
+ - acc = 0
+ + acc = zero(eltype(xs))
+Run this? [y/N] y
+```
+
+Provider selection is automatic at load: `ANTHROPIC_API_KEY` → Claude
+(`claude-opus-4-8`), else `OPENAI_API_KEY` → OpenAI, else a local Ollama
+server. Embeddings for doc search are chosen separately (OpenAI or Ollama —
+Anthropic has no embeddings endpoint). Programmatic entry points:
+`Wink.ask("...")`, `Wink.configure!(...)`, `Wink.autoeval!(true)`,
+`Wink.reindex!()`.
+
 > **Status: work in progress.** The package is under active initial development
 > and not yet registered.

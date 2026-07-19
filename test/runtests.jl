@@ -22,4 +22,7 @@ using TestPkg
     include("test_repl.jl")
     include("test_edit.jl")
     include("test_rag.jl")
+    if get(ENV, "WINK_LIVE_TESTS", "") == "true"
+        include("live/runtests.jl")
+    end
 end
