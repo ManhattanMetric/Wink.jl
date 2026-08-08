@@ -33,6 +33,7 @@ Mutable session configuration for Wink. Access the live instance as
 """
 Base.@kwdef mutable struct WinkConfig
     chat_model::String = ""
+    chat_api_base::String = ""          # "" => provider default; else an OpenAI-compatible base URL
     embed_model::String = ""            # "" => no embedding backend; RAG degrades
     autoeval::Bool = false
     confirm::Function = default_confirm # (kind::Symbol, text) -> Bool
@@ -82,14 +83,24 @@ function detect_providers!(cfg::WinkConfig = CONFIG)
 end
 
 """
-    configure!(; chat_model, chat_schema, embed_model, embed_schema, autoeval,
-                 max_rounds, max_tokens, tool_output_limit, instructions) -> WinkConfig
+    configure!(; chat_model, chat_schema, chat_api_base, embed_model, embed_schema,
+                 autoeval, max_rounds, max_tokens, tool_output_limit, instructions) -> WinkConfig
 
 Override Wink's configuration. Model names unknown to PromptingTools' registry
 are registered when the matching `*_schema` is supplied (e.g.
 `configure!(chat_model = "my-model", chat_schema = PromptingTools.OllamaSchema())`);
 without a schema an unknown name would route to the default (OpenAI) provider,
 so a warning is emitted.
+
+`chat_api_base` points chat requests at an OpenAI-compatible server (LM Studio,
+llama.cpp, vLLM, …), e.g.
+
+    configure!(chat_model = "prism-ml/bonsai-27b",
+               chat_api_base = "http://localhost:1234/v1")
+
+An unknown `chat_model` is then auto-registered with `CustomOpenAISchema`, and
+when no `OPENAI_API_KEY` is set a placeholder key is sent (local servers accept
+any key). Pass `chat_api_base = ""` to return to the provider's default URL.
 
 `instructions` sets session-level standing instructions for the model — they
 are appended to the system prompt alongside any global
@@ -98,11 +109,18 @@ Prompt changes take effect when the next conversation starts (`Wink.reset!()`
 or `:reset`).
 """
 function configure!(; chat_model = nothing, chat_schema = nothing,
-        embed_model = nothing, embed_schema = nothing,
+        chat_api_base = nothing, embed_model = nothing, embed_schema = nothing,
         autoeval = nothing, max_rounds = nothing, max_tokens = nothing,
         tool_output_limit = nothing, instructions = nothing)
+    chat_api_base === nothing || (CONFIG.chat_api_base = String(chat_api_base))
     if chat_model !== nothing
-        _adopt_model!(chat_model, chat_schema, "chat_model")
+        schema = if chat_schema === nothing && !isempty(CONFIG.chat_api_base) &&
+                    !haskey(PT.MODEL_REGISTRY, String(chat_model))
+            PT.CustomOpenAISchema()
+        else
+            chat_schema
+        end
+        _adopt_model!(chat_model, schema, "chat_model")
         CONFIG.chat_model = String(chat_model)
     end
     if embed_model !== nothing

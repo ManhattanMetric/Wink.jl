@@ -128,6 +128,8 @@ end
 function show_config(io::IO = stdout)
     c = CONFIG
     println(io, "chat_model        = ", c.chat_model)
+    isempty(c.chat_api_base) ||
+        println(io, "chat_api_base     = ", c.chat_api_base)
     println(io, "embed_model       = ",
         isempty(c.embed_model) ? "(none — keyword doc search only)" : c.embed_model)
     println(io, "autoeval          = ", c.autoeval)

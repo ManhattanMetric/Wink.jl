@@ -217,10 +217,19 @@ end
 
 function _aitools_call(schema, history, tools)
     sch = schema === nothing ? _model_schema(CONFIG.chat_model) : schema
-    api_kwargs = sch isa PT.AbstractAnthropicSchema ?
-                 (; max_tokens = CONFIG.max_tokens) : NamedTuple()
+    api_kwargs = NamedTuple()
+    key_kwargs = NamedTuple()
+    if sch isa PT.AbstractAnthropicSchema
+        api_kwargs = (; max_tokens = CONFIG.max_tokens)
+    elseif sch isa Union{PT.CustomOpenAISchema, PT.LocalServerOpenAISchema}
+        isempty(CONFIG.chat_api_base) ||
+            (api_kwargs = (; url = CONFIG.chat_api_base))
+        # OpenAI.jl rejects an empty api key even though local servers ignore
+        # it; send a placeholder unless a real key is available as a fallback.
+        isempty(PT.OPENAI_API_KEY) && (key_kwargs = (; api_key = "wink-local"))
+    end
     kwargs = (; tools, model = CONFIG.chat_model, return_all = false,
-        verbose = false, api_kwargs)
+        verbose = false, api_kwargs, key_kwargs...)
     return schema === nothing ? PT.aitools(history; kwargs...) :
            PT.aitools(schema, history; kwargs...)
 end

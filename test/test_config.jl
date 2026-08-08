@@ -40,6 +40,17 @@
     # ...and warns when it cannot fix routing
     @test_logs (:warn,) match_mode = :any Wink.configure!(chat_model = "wink-unknown-abc")
 
+    # configure! with chat_api_base auto-registers the model for an
+    # OpenAI-compatible local server (no warning, CustomOpenAISchema routing)
+    @test_logs Wink.configure!(chat_model = "wink-local-model-xyz",
+        chat_api_base = "http://localhost:1234/v1")
+    @test Wink.CONFIG.chat_api_base == "http://localhost:1234/v1"
+    @test Wink.CONFIG.chat_model == "wink-local-model-xyz"
+    @test PT.MODEL_REGISTRY["wink-local-model-xyz"].schema isa PT.CustomOpenAISchema
+    @test Wink._model_schema("wink-local-model-xyz") isa PT.CustomOpenAISchema
+    Wink.configure!(chat_api_base = "")
+    @test isempty(Wink.CONFIG.chat_api_base)
+
     Wink.autoeval!(true)
     @test Wink.CONFIG.autoeval
     Wink.autoeval!(false)
