@@ -251,14 +251,16 @@ end
 """
     search_packages(pattern::String) -> String
 
-Search the package registries Pkg has on disk (e.g. General, ~14k packages) by
-package name — offline, no network. Use before recommending, or assuming the
-existence of, any package. Matching is case-insensitive substring over names
-only — not descriptions — so try short name guesses ("csv", "http", "plot")
-rather than task phrases. Results rank exact matches first and show each hit's
-latest registered version, repository URL, and whether it is already a
-dependency of the active project or loaded in this session. `_jll` binary
-wrappers are hidden unless the pattern mentions "jll".
+Search the package registries Pkg has on disk (e.g. General, ~14k packages) —
+offline, no network. Use before recommending, or assuming the existence of,
+any package. Names always match by case-insensitive substring; when the local
+description index has been built, descriptions and topics match too (by
+keyword, and by meaning if the index is embedded), so both short name guesses
+("csv") and task phrases ("read parquet files") work — the output's first line
+says which layers are active. Results rank exact name matches first and show
+each hit's latest registered version, description, repository URL, and whether
+it is already a dependency of the active project or loaded in this session.
+`_jll` binary wrappers are hidden unless the pattern mentions "jll".
 """
 tool_search_packages(pattern::String) = tool_guard("search_packages") do
     search_packages_text(pattern)

@@ -78,6 +78,8 @@ run code in this session. Meta-commands:
   :model [name]   show or set the chat model
   :prompt         show the system prompt a new conversation would get
   :reindex        (re)build the documentation search index
+  :pkgindex       fetch package descriptions from GitHub and index them for
+                  search_packages (one-time; needs GITHUB_TOKEN or gh login)
 Everything else you type is sent to the model. Ctrl-C interrupts a turn.
 Backspace at an empty ai> prompt returns to julia>.
 """
@@ -119,6 +121,12 @@ function handle_meta_command(cmd::AbstractString; io::IO = stdout)
                 ":reset applies changes)\n"; color = :light_black)
     elseif head == ":reindex"
         reindex!()
+    elseif head == ":pkgindex"
+        try
+            index_packages!(; io)
+        catch e
+            e isa InterruptException || println(io, sprint(showerror, e))
+        end
     else
         println(io, "unknown command ", head, " — try :help")
     end

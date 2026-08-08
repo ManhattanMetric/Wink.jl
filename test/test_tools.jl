@@ -81,6 +81,24 @@
         @test occursin("no packages matching",
             Wink.tool_search_packages("zzqqxxnosuchpkg"))
         @test startswith(Wink.tool_search_packages(""), "ERROR")
+
+        # description/topic layers via an injected index (no network, no disk)
+        old_idx = Wink.PKG_INDEX[]
+        try
+            Wink.PKG_INDEX[] = Wink.PkgIndex(
+                [Wink.PkgDesc("DataFrames", "In-memory tabular data in Julia",
+                     ["data-frame"]),
+                 Wink.PkgDesc("CSV",
+                     "Utility library for working with CSV and other delimited files",
+                     ["csv-files"])],
+                0.0, "", nothing)
+            sp = Wink.tool_search_packages("tabular")
+            @test occursin(r"DataFrames v\d.*In-memory tabular data", sp)
+            @test occursin("CSV v", Wink.tool_search_packages("delimited"))
+            @test occursin("DataFrames", Wink.tool_search_packages("data-frame"))
+        finally
+            Wink.PKG_INDEX[] = old_idx
+        end
     end
 
     long = repeat("x", 10_000)

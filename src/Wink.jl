@@ -25,6 +25,8 @@ using Markdown
 using REPL
 using InteractiveUtils
 import Pkg
+import Downloads
+import JSON3
 
 include("config.jl")
 include("resolve.jl")
@@ -37,7 +39,7 @@ include("rag.jl")
 include("agent.jl")
 include("repl.jl")
 
-export configure!, autoeval!, ask, reset!, reindex!
+export configure!, autoeval!, ask, reset!, reindex!, index_packages!
 
 function __init__()
     # CONFIG is constructed during precompilation, so its status_io field holds

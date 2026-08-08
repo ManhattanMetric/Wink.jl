@@ -20,7 +20,7 @@ confirmation (unless `Wink.autoeval!(true)`).
 | `read_file(path, first_line, last_line)` | Line-numbered file reading, restricted to the active project, loaded packages, and Julia's source tree. |
 | `list_names(pattern)` | Keyword search over loaded docstrings (`apropos`). |
 | `search_docs(query, top_k)` | Semantic docstring search over everything loaded (embedding index; keyword fallback without an embedding provider). |
-| `search_packages(pattern)` | Offline name search over the on-disk package registries (General, ~14k packages): latest version, repo URL, and whether each hit is already in your project or loaded. |
+| `search_packages(pattern)` | Offline layered search over the on-disk package registries (General, ~14k packages): names always; descriptions/topics by keyword and by meaning once the local description index is built (`Wink.index_packages!()` / `:pkgindex`, one-time GitHub fetch). Shows latest version, description, repo URL, and whether each hit is already in your project or loaded. |
 
 Signature strings accept bare names (`"sort"`), qualified names
 (`"Base.Docs.doc"`), and typed forms (`"sort(::Vector{Int})"`,
