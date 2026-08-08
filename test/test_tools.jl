@@ -1,7 +1,8 @@
 @testset "tools" begin
     tm = Wink.build_tool_map()
-    for name in ("list_methods", "get_source", "get_ir", "get_doc", "type_info",
-        "module_info", "where_defined", "read_file", "list_names")
+    for name in ("list_methods", "methods_with", "get_source", "get_ir", "get_doc",
+        "type_info", "module_info", "list_variables", "where_defined", "read_file",
+        "list_names")
         @test haskey(tm, name)
         @test tm[name] isa PT.Tool
     end
@@ -22,6 +23,15 @@
     @test occursin("[1]", out)
     @test occursin("[2]", out)
 
+    mw = Wink.tool_methods_with("String", "TestPkg", "")
+    @test occursin("with an argument of type `String`", mw)
+    @test occursin("greet", mw)
+    @test occursin("combine", mw)
+    mw = Wink.tool_methods_with("TestPkg.Point", "TestPkg", "")
+    @test occursin("simulate", mw)
+    @test startswith(Wink.tool_methods_with("NoSuchType_XYZ", "", ""), "ERROR")
+    @test startswith(Wink.tool_methods_with("String", "TestPkg.greet", ""), "ERROR")
+
     out = Wink.tool_get_ir("TestPkg.twice(::Int)", "llvm")
     @test !startswith(out, "ERROR")
     @test !isempty(strip(out))
@@ -37,6 +47,14 @@
 
     @test occursin("greet", Wink.tool_module_info("TestPkg", ""))
     @test startswith(Wink.tool_module_info("TestPkg.greet", ""), "ERROR")
+
+    @eval Main wink_test_var_xyz = collect(1:100)
+    lv = Wink.tool_list_variables("", "wink_test_var")
+    @test occursin("wink_test_var_xyz", lv)
+    @test occursin("100-element", lv)
+    @test occursin("greet", Wink.tool_list_variables("TestPkg", ""))
+    @test !occursin("greet", Wink.tool_list_variables("TestPkg", "Point"))
+    @test startswith(Wink.tool_list_variables("TestPkg.greet", ""), "ERROR")
 
     wd = Wink.tool_where_defined("TestPkg.greet(::String)")
     @test occursin("TestPkg.jl:", wd)

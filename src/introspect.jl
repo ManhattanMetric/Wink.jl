@@ -205,17 +205,23 @@ Format the method table of `f` (optionally narrowed to methods applicable to
 """
 function methodtable_text(f; argtypes::Union{Nothing, Type{<:Tuple}} = nothing)
     ms = argtypes === nothing ? methods(f) : methods(f, argtypes)
-    n = length(ms)
     fname = try
         string(nameof(f))
     catch
         string(f)
     end
     io = IOBuffer()
-    println(io, n, " method", n == 1 ? "" : "s", " for `", fname, "`:")
+    println(io, length(ms), " method", length(ms) == 1 ? "" : "s", " for `", fname, "`:")
+    print_method_lines(io, ms)
+    return String(take!(io))
+end
+
+# Shared numbered-listing body for method collections (Revise-aware locations).
+function print_method_lines(io::IO, ms; limit::Integer = 60)
+    n = length(ms)
     for (i, m) in enumerate(ms)
-        if i > 60
-            println(io, "  … and ", n - 60, " more")
+        if i > limit
+            println(io, "  … and ", n - limit, " more")
             break
         end
         file, line = try
@@ -226,5 +232,39 @@ function methodtable_text(f; argtypes::Union{Nothing, Type{<:Tuple}} = nothing)
         sig = first(split(sprint(show, m), " @ "))
         println(io, "  [", i, "] ", sig, "  @ ", file, ":", line)
     end
+    return nothing
+end
+
+"""
+    methodswith_text(T::Type; mod = nothing, supertypes = false) -> String
+
+Format the methods accepting an argument of type `T` (the reverse lookup of
+[`methodtable_text`](@ref)), searched across all loaded modules or only `mod`.
+The total count always leads the output so it survives truncation.
+"""
+function methodswith_text(T::Type; mod::Union{Nothing, Module} = nothing,
+        supertypes::Bool = false)
+    ms = if mod === nothing
+        methodswith(T; supertypes)
+    else
+        # methodswith(T, mod) only sweeps exported names; a module-scoped query
+        # is usually about the user's own code, so include unexported functions.
+        meths = Method[]
+        for nm in names(mod; all = true)
+            startswith(String(nm), '#') && continue
+            isdefined(mod, nm) || continue
+            f = getfield(mod, nm)
+            f isa Base.Callable || continue
+            methodswith(T, f, meths; supertypes)
+        end
+        unique(meths)
+    end
+    n = length(ms)
+    io = IOBuffer()
+    println(io, n, " method", n == 1 ? "" : "s",
+        mod === nothing ? " in loaded modules" : " in $(mod)",
+        " with an argument of type `", T, "`",
+        supertypes ? " (declared for it or a supertype)" : "", ":")
+    print_method_lines(io, ms)
     return String(take!(io))
 end

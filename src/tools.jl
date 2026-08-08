@@ -71,6 +71,32 @@ tool_list_methods(signature::String) = tool_guard("list_methods") do
 end
 
 """
+    methods_with(type_name::String, module_name::String, supertypes::String) -> String
+
+List the methods that accept an argument of the given type — the reverse of
+`list_methods`, and the direct answer to "what can I call with an X?" or "how
+many methods take an X?". Searches the exported names of every loaded module,
+or — when `module_name` is given (`""` for all) — that module including its
+unexported functions. Pass `"true"` for `supertypes` to also count methods
+declared for supertypes (e.g. `methods_with("String", "", "true")` includes
+`::AbstractString` methods). The total count is the first line; the listing
+after it may be truncated.
+"""
+tool_methods_with(type_name::String, module_name::String, supertypes::String) =
+    tool_guard("methods_with") do
+        T = resolve_type(type_name)
+        mod = if isempty(strip(module_name))
+            nothing
+        else
+            m = resolve_binding(module_name)
+            m isa Module ||
+                throw(WinkResolveError("`$module_name` is a $(typeof(m)), not a module"))
+            m
+        end
+        methodswith_text(T; mod, supertypes = lowercase(strip(supertypes)) == "true")
+    end
+
+"""
     get_source(signature::String) -> String
 
 Return the actual source code of a method, read from its source file — this is
@@ -144,6 +170,29 @@ tool_module_info(module_name::String, include_private::String) =
         m isa Module ||
             throw(WinkResolveError("`$module_name` is a $(typeof(m)), not a module"))
         modinfo_text(m; all = lowercase(strip(include_private)) == "true")
+    end
+
+"""
+    list_variables(module_name::String, pattern::String) -> String
+
+List the bindings a module currently holds with each one's size and a one-line
+summary of its value (like the REPL's `varinfo`). With `module_name` `""` it
+shows the user's workspace `Main` — the way to see what the user has defined
+and computed in this session before reasoning about their data. `pattern`
+optionally filters names by regex (`""` for all).
+"""
+tool_list_variables(module_name::String, pattern::String) =
+    tool_guard("list_variables") do
+        m = if isempty(strip(module_name))
+            Main
+        else
+            b = resolve_binding(module_name)
+            b isa Module ||
+                throw(WinkResolveError("`$module_name` is a $(typeof(b)), not a module"))
+            b
+        end
+        pat = isempty(strip(pattern)) ? r"" : Regex(strip(pattern))
+        rstrip(Markdown.plain(varinfo(m, pat)))
     end
 
 """
@@ -248,11 +297,13 @@ end
 # edit_file) and search_docs are appended by later milestones' files.
 const TOOL_SPECS = Pair{String, Function}[
     "list_methods" => tool_list_methods,
+    "methods_with" => tool_methods_with,
     "get_source" => tool_get_source,
     "get_ir" => tool_get_ir,
     "get_doc" => tool_get_doc,
     "type_info" => tool_type_info,
     "module_info" => tool_module_info,
+    "list_variables" => tool_list_variables,
     "where_defined" => tool_where_defined,
     "read_file" => tool_read_file,
     "list_names" => tool_list_names,

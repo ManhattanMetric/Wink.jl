@@ -169,6 +169,8 @@ function system_prompt()
     Ground rules:
     - Introspection tools are ground truth. Never recite source code from memory —
       call get_source. Use list_methods when unsure which method dispatch selects,
+      methods_with to find what can be called with a value of a given type,
+      list_variables to see what the session currently defines,
       get_ir with level "warntype" as the first stop for performance questions, and
       get_doc before assuming an API's behavior.
     - Prefer small, verifiable eval_code steps; check intermediate results instead
