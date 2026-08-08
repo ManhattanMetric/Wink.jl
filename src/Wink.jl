@@ -27,6 +27,7 @@ using InteractiveUtils
 import Pkg
 import Downloads
 import JSON3
+import JuliaSyntaxHighlighting
 
 include("config.jl")
 include("resolve.jl")

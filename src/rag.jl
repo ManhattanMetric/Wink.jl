@@ -180,7 +180,7 @@ function load_index!(; io::IO = CONFIG.status_io)
     end
     (idx isa DocIndex && idx.model == CONFIG.embed_model) || return nothing
     DOC_INDEX[] = idx
-    status(io, "loaded cached doc index ($(length(idx.chunks)) chunks)")
+    debug_status(io, "loaded cached doc index ($(length(idx.chunks)) chunks)")
     return idx
 end
 

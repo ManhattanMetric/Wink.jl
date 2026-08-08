@@ -189,6 +189,45 @@ end
 
 status(io::IO, s::AbstractString) = printstyled(io, "  ", s, "\n"; color = :light_black)
 
+# Diagnostic feedback (loop mechanics, cache hits): only shown when
+# CONFIG.debug is on; toggle with configure!(debug = true) or :debug on.
+debug_status(io::IO, s::AbstractString) = CONFIG.debug ? status(io, s) : nothing
+
+"""
+    with_thinking(f, io) -> result of f()
+
+Run `f` while showing a "thinking" indicator on `io`. On a TTY the indicator
+animates in place, cycling "thinking." / ".." / "..." and erasing itself when
+`f` returns; elsewhere it degrades to a single static status line. With
+`CONFIG.debug` on, the chat model's name is included.
+"""
+function with_thinking(f::Function, io::IO)
+    label = CONFIG.debug ? "thinking ($(CONFIG.chat_model))" : "thinking"
+    if !(io isa Base.TTY)
+        status(io, label * "...")
+        return f()
+    end
+    done = Ref(false)
+    spinner = @async begin
+        i = 0
+        while !done[]
+            print(io, "\r\e[2K")
+            printstyled(io, "  ", label, "."^(i % 3 + 1); color = :light_black)
+            flush(io)
+            i += 1
+            sleep(0.35)
+        end
+        print(io, "\r\e[2K")
+        flush(io)
+    end
+    try
+        return f()
+    finally
+        done[] = true
+        wait(spinner)
+    end
+end
+
 function compact_args(args)
     (args === nothing || isempty(args)) && return ""
     parts = String[]
@@ -261,8 +300,7 @@ function run_turn!(chat::Chat, user_text::AbstractString;
     tools = collect(values(chat.tool_map))
     try
         for _ in 1:CONFIG.max_rounds
-            status(io, "… thinking ($(CONFIG.chat_model))")
-            msg = _aitools_call(schema, chat.history, tools)
+            msg = with_thinking(() -> _aitools_call(schema, chat.history, tools), io)
             _tally!(chat, msg)
             calls = msg.tool_calls
             if isempty(calls)
@@ -277,7 +315,8 @@ function run_turn!(chat::Chat, user_text::AbstractString;
                                        "transcript are records of calls already made. " *
                                        "Invoke $(name) through the tool-calling " *
                                        "interface to actually run it.)"))
-                    status(io, "… model wrote a tool call as text; asking for a real $(name) call")
+                    debug_status(io,
+                        "model wrote a tool call as text; asking for a real $(name) call")
                     continue
                 end
                 return text
@@ -297,11 +336,11 @@ function run_turn!(chat::Chat, user_text::AbstractString;
             push!(chat.history, PT.UserMessage(join(results, "\n")))
         end
         # Round cap reached: force a final, tool-free answer.
-        status(io, "… tool-round limit reached; asking for a final answer")
+        debug_status(io, "tool-round limit reached; asking for a final answer")
         push!(chat.history,
             PT.UserMessage("Tool budget exhausted ($(CONFIG.max_rounds) rounds). " *
                            "Summarize your findings and answer now without further tool calls."))
-        msg = _aitools_call(schema, chat.history, PT.AbstractTool[])
+        msg = with_thinking(() -> _aitools_call(schema, chat.history, PT.AbstractTool[]), io)
         _tally!(chat, msg)
         text = something(msg.content, "")
         push!(chat.history, PT.AIMessage(text))

@@ -92,6 +92,9 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     end
     @test Main.WINK_AGENT_SENTINEL == 42
 
+    # --- thinking indicator: non-TTY path is a plain status line, result passes ---
+    @test Wink.with_thinking(() -> 42, devnull) == 42
+
     # --- textual tool-call detection (imitation of the flattened transcript) ---
     tools = ("get_doc", "get_source", "eval_code")
     @test Wink.textual_tool_call("Let me check:\n→ get_doc(name=\"sort\")", tools) ==

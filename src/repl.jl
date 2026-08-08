@@ -51,19 +51,60 @@ function handle_ai_input(s::AbstractString)
     return nothing
 end
 
+# Answers are printed verbatim rather than Markdown-rendered: full rendering
+# reflows prose and mangles identifiers (snake_case reads as emphasis). Only
+# code is styled — fenced blocks get real Julia syntax highlighting, inline
+# `spans` a color.
 function print_answer(answer::AbstractString; io::IO = stdout)
     isempty(strip(answer)) && return nothing
-    md = try
-        Markdown.parse(String(answer))
-    catch
-        nothing
+    fence = nothing        # language of the open fence, or nothing
+    code_lines = String[]
+    for line in split(answer, '\n')
+        m = match(r"^\s*```(\S*)\s*$", line)
+        if m !== nothing
+            if fence === nothing
+                fence = lowercase(something(m.captures[1], ""))
+                empty!(code_lines)
+            else
+                print_code_block(io, join(code_lines, '\n'), fence)
+                fence = nothing
+            end
+        elseif fence !== nothing
+            push!(code_lines, String(line))
+        else
+            print_prose_line(io, line)
+        end
     end
-    if md === nothing
-        println(io, answer)
+    fence === nothing || print_code_block(io, join(code_lines, '\n'), fence)
+    return nothing
+end
+
+function print_code_block(io::IO, code::AbstractString, lang::AbstractString)
+    body = if lang in ("julia", "julia-repl", "jl", "")
+        try
+            JuliaSyntaxHighlighting.highlight(code)
+        catch
+            code
+        end
     else
-        show(io, MIME"text/plain"(), md)
-        println(io)
+        code
     end
+    printstyled(io, "```", lang, "\n"; color = :light_black)
+    println(io, body)
+    printstyled(io, "```\n"; color = :light_black)
+    return nothing
+end
+
+# Prose is written exactly as the model produced it; only inline `code` spans
+# are colored.
+function print_prose_line(io::IO, line::AbstractString)
+    i = firstindex(line)
+    for m in eachmatch(r"`([^`]+)`", line)
+        print(io, SubString(line, i, prevind(line, m.offset)))
+        printstyled(io, m.captures[1]; color = :cyan)
+        i = m.offset + ncodeunits(m.match)
+    end
+    println(io, SubString(line, i))
     return nothing
 end
 
@@ -75,6 +116,7 @@ run code in this session. Meta-commands:
   :history        print the conversation so far
   :config         show current configuration
   :autoeval on|off  toggle confirmation-free execution of model code/edits
+  :debug on|off   show diagnostic status lines (model name, agent-loop notes)
   :model [name]   show or set the chat model
   :prompt         show the system prompt a new conversation would get
   :reindex        (re)build the documentation search index
@@ -104,6 +146,14 @@ function handle_meta_command(cmd::AbstractString; io::IO = stdout)
         else
             println(io, "usage: :autoeval on|off (currently ",
                 CONFIG.autoeval ? "on" : "off", ")")
+        end
+    elseif head == ":debug"
+        if length(parts) == 2 && parts[2] in ("on", "off")
+            configure!(debug = parts[2] == "on")
+            println(io, "debug output ", parts[2])
+        else
+            println(io, "usage: :debug on|off (currently ",
+                CONFIG.debug ? "on" : "off", ")")
         end
     elseif head == ":model"
         if length(parts) >= 2
@@ -146,5 +196,6 @@ function show_config(io::IO = stdout)
     println(io, "max_rounds        = ", c.max_rounds)
     println(io, "max_tokens        = ", c.max_tokens)
     println(io, "tool_output_limit = ", c.tool_output_limit)
+    println(io, "debug             = ", c.debug)
     return nothing
 end

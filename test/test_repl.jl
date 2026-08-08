@@ -41,8 +41,17 @@
     Wink.handle_meta_command(":prompt"; io = buf)
     @test occursin("Session facts", String(take!(buf)))
 
-    Wink.print_answer("**bold** and `code`"; io = buf)
-    @test !isempty(String(take!(buf)))
+    # prose is verbatim (snake_case must survive), code blocks stay fenced
+    Wink.print_answer("call `get_source` on snake_case_name\n```julia\nx = 1\n```";
+        io = buf)
+    out = String(take!(buf))
+    @test occursin("snake_case_name", out)
+    @test occursin("get_source", out)
+    @test occursin("```julia", out)
+    @test occursin("x = 1", out)
+    # unterminated fence still prints its code
+    Wink.print_answer("```julia\ny = 2"; io = buf)
+    @test occursin("y = 2", String(take!(buf)))
     Wink.print_answer(""; io = buf)
     @test isempty(String(take!(buf)))
 

@@ -64,6 +64,11 @@
     Wink.autoeval!(false)
     @test !Wink.CONFIG.autoeval
 
+    Wink.configure!(debug = true)
+    @test Wink.CONFIG.debug
+    Wink.configure!(debug = false)
+    @test !Wink.CONFIG.debug
+
     # put global config back in a sane state for later suites
     Wink.detect_providers!(Wink.CONFIG)
 end

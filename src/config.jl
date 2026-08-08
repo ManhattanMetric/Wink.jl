@@ -42,6 +42,7 @@ Base.@kwdef mutable struct WinkConfig
     max_tokens::Int = 8192
     tool_output_limit::Int = 4_000
     status_io::IO = stderr
+    debug::Bool = false                 # show diagnostic status lines (model name, loop notes)
     instructions::String = ""           # session-level standing instructions
 end
 
@@ -137,7 +138,8 @@ or `:reset`).
 function configure!(; chat_model = nothing, chat_schema = nothing,
         chat_api_base = nothing, embed_model = nothing, embed_schema = nothing,
         embed_api_base = nothing, autoeval = nothing, max_rounds = nothing,
-        max_tokens = nothing, tool_output_limit = nothing, instructions = nothing)
+        max_tokens = nothing, tool_output_limit = nothing, instructions = nothing,
+        debug = nothing)
     chat_api_base === nothing || (CONFIG.chat_api_base = String(chat_api_base))
     embed_api_base === nothing || (CONFIG.embed_api_base = String(embed_api_base))
     if chat_model !== nothing
@@ -155,6 +157,7 @@ function configure!(; chat_model = nothing, chat_schema = nothing,
     max_tokens === nothing || (CONFIG.max_tokens = Int(max_tokens))
     tool_output_limit === nothing || (CONFIG.tool_output_limit = Int(tool_output_limit))
     instructions === nothing || (CONFIG.instructions = String(instructions))
+    debug === nothing || (CONFIG.debug = Bool(debug))
     return CONFIG
 end
 
