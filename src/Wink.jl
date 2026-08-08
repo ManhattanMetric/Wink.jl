@@ -24,9 +24,11 @@ using LinearAlgebra
 using Markdown
 using REPL
 using InteractiveUtils
+import Pkg
 
 include("config.jl")
 include("resolve.jl")
+include("registry.jl")
 include("introspect.jl")
 include("tools.jl")
 include("evalengine.jl")

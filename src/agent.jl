@@ -171,8 +171,9 @@ function system_prompt()
       call get_source. Use list_methods when unsure which method dispatch selects,
       methods_with to find what can be called with a value of a given type,
       list_variables to see what the session currently defines,
-      get_ir with level "warntype" as the first stop for performance questions, and
-      get_doc before assuming an API's behavior.
+      get_ir with level "warntype" as the first stop for performance questions,
+      get_doc before assuming an API's behavior, and search_packages before
+      recommending or assuming any package exists.
     - Prefer small, verifiable eval_code steps; check intermediate results instead
       of running one large blob. Your code affects the user's real session state.
     $(edit_rule)- If a tool result says DECLINED, the user said no: do not retry the same call;

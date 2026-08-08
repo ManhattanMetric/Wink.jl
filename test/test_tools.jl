@@ -2,7 +2,7 @@
     tm = Wink.build_tool_map()
     for name in ("list_methods", "methods_with", "get_source", "get_ir", "get_doc",
         "type_info", "module_info", "list_variables", "where_defined", "read_file",
-        "list_names")
+        "list_names", "search_packages")
         @test haskey(tm, name)
         @test tm[name] isa PT.Tool
     end
@@ -68,6 +68,20 @@
     @test startswith(Wink.tool_read_file("/etc/hosts", "", ""), "ERROR")
 
     @test occursin("greet", Wink.tool_list_names("friendly greeting"))
+
+    if !isempty(Wink.Pkg.Registry.reachable_registries())
+        sp = Wink.tool_search_packages("DataFrames")
+        @test occursin(r"DataFrames v\d", sp)
+        @test occursin("JuliaData/DataFrames.jl", sp)
+        # exact match ranks ahead of prefix matches like DataFramesMeta
+        @test first(findfirst("  DataFrames v", sp)) <
+              first(findfirst("DataFramesMeta", sp))
+        @test occursin("loaded", Wink.tool_search_packages("PromptingTools"))
+        @test !occursin("_jll", Wink.tool_search_packages("OpenSSL"))
+        @test occursin("no packages matching",
+            Wink.tool_search_packages("zzqqxxnosuchpkg"))
+        @test startswith(Wink.tool_search_packages(""), "ERROR")
+    end
 
     long = repeat("x", 10_000)
     t = Wink.truncate_output(long; limit = 1000)

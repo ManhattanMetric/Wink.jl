@@ -248,6 +248,22 @@ tool_list_names(pattern::String) = tool_guard("list_names") do
     isempty(strip(out)) ? "(no matches for \"$q\")" : out
 end
 
+"""
+    search_packages(pattern::String) -> String
+
+Search the package registries Pkg has on disk (e.g. General, ~14k packages) by
+package name — offline, no network. Use before recommending, or assuming the
+existence of, any package. Matching is case-insensitive substring over names
+only — not descriptions — so try short name guesses ("csv", "http", "plot")
+rather than task phrases. Results rank exact matches first and show each hit's
+latest registered version, repository URL, and whether it is already a
+dependency of the active project or loaded in this session. `_jll` binary
+wrappers are hidden unless the pattern mentions "jll".
+"""
+tool_search_packages(pattern::String) = tool_guard("search_packages") do
+    search_packages_text(pattern)
+end
+
 # ---- read perimeter ----------------------------------------------------------
 
 realpath_or(p::AbstractString) = try
@@ -307,6 +323,7 @@ const TOOL_SPECS = Pair{String, Function}[
     "where_defined" => tool_where_defined,
     "read_file" => tool_read_file,
     "list_names" => tool_list_names,
+    "search_packages" => tool_search_packages,
 ]
 
 """
