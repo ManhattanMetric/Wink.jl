@@ -115,7 +115,7 @@ run code in this session. Meta-commands:
   :reset          start a fresh conversation
   :history        print the conversation so far
   :config         show current configuration
-  :autoeval on|off  toggle confirmation-free execution of model code/edits
+  :autoeval on|off  toggle confirmation-free execution of model code/shell/edits
   :debug on|off   show diagnostic status lines (model name, agent-loop notes)
   :model [name]   show or set the chat model
   :prompt         show the system prompt a new conversation would get

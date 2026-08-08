@@ -103,7 +103,11 @@ Evaluate Julia code directly in the user's live `Main` session and return the
 resulting value plus captured stdout/stderr. The code must be syntactically
 valid Julia — not Python: blocks close with `end` (never a `:` after `for`/
 `if`), indexing is 1-based, and only functions that exist in this session may
-be called (verify with list_names or get_doc when unsure). It runs with REPL
+be called (verify with list_names or get_doc when unsure). For shell commands
+(git, mkdir, curl, anything you would type in a terminal) use the run_shell
+tool instead of eval_code: Julia has no `system()`, `run` accepts only
+backtick command literals — never plain strings or vectors — and a backtick
+literal by itself constructs a command without running it. It runs with REPL
 semantics (soft scope), so write it exactly as you would type it at the `julia>` prompt;
 definitions, variables, and side effects persist for both you and the user.
 Unless auto-approval is on, the user is shown the code first and may decline —

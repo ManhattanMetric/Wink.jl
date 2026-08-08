@@ -18,6 +18,7 @@ using TestPkg
     include("test_tools.jl")
     include("test_config.jl")
     include("test_eval.jl")
+    include("test_shell.jl")
     include("test_agent.jl")
     include("test_repl.jl")
     include("test_edit.jl")

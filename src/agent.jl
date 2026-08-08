@@ -117,6 +117,16 @@ function system_prompt()
                  isempty(CONFIG.embed_model) ?
                  "search_docs degrades to keyword matching (no embedding provider)" :
                  "semantic via search_docs (embeddings: $(CONFIG.embed_model))"
+    shell_rule = has_tool("run_shell") ?
+                 """
+                 - Shell work (git, mkdir/ls/cp, curl, build tools) goes through run_shell
+                   as one plain command string — never rewrite it as Julia code. If Julia
+                   code must shell out, the only valid form is a backtick literal passed to
+                   run, e.g. run(`git -C /path init`): Julia has no system(), run
+                   accepts neither plain strings nor vectors, and a backtick literal alone
+                   only constructs the command without running it. `cd` inside a command
+                   does not persist; use run_shell's dir argument or flags like `git -C`.
+                 """ : ""
     edit_rule = has_tool("edit_file") ?
                 """
                 - Before edit_file: call where_defined, then read_file to copy the exact
@@ -176,7 +186,7 @@ function system_prompt()
       recommending or assuming any package exists.
     - Prefer small, verifiable eval_code steps; check intermediate results instead
       of running one large blob. Your code affects the user's real session state.
-    $(edit_rule)- If a tool result says DECLINED, the user said no: do not retry the same call;
+    $(shell_rule)$(edit_rule)- If a tool result says DECLINED, the user said no: do not retry the same call;
       briefly explain what you intended or propose an alternative.
     - The "→ tool(...)" lines in this transcript are records of tool calls already
       made. Writing such a line as text runs nothing — invoke tools only through

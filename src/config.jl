@@ -3,12 +3,14 @@
 """
     default_confirm(kind::Symbol, text::AbstractString) -> Bool
 
-Show a proposed action (`kind` is `:eval` or `:edit`) and ask the user for y/n
-approval on stdin. Returns `false` (deny) in non-interactive sessions, on
-Ctrl-C, and on anything but an explicit yes.
+Show a proposed action (`kind` is `:eval`, `:edit`, or `:shell`) and ask the
+user for y/n approval on stdin. Returns `false` (deny) in non-interactive
+sessions, on Ctrl-C, and on anything but an explicit yes.
 """
 function default_confirm(kind::Symbol, text::AbstractString)
-    header = kind === :edit ? "--- proposed edit ---" : "--- proposed code ---"
+    header = kind === :edit ? "--- proposed edit ---" :
+             kind === :shell ? "--- proposed shell command ---" :
+             "--- proposed code ---"
     printstyled(stdout, "\n", header, "\n"; color = :yellow, bold = true)
     println(stdout, text)
     printstyled(stdout, "-"^length(header), "\n"; color = :yellow)
@@ -181,8 +183,8 @@ end
 """
     autoeval!(flag::Bool) -> Bool
 
-Enable (`true`) or disable (`false`) automatic execution of model-proposed code
-and file edits. When disabled (the default) every `eval_code`/`edit_file` tool
-call asks for y/n confirmation first.
+Enable (`true`) or disable (`false`) automatic execution of model-proposed code,
+shell commands, and file edits. When disabled (the default) every
+`eval_code`/`run_shell`/`edit_file` tool call asks for y/n confirmation first.
 """
 autoeval!(flag::Bool) = (CONFIG.autoeval = flag)
