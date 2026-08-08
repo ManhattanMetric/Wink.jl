@@ -38,6 +38,9 @@ include("repl.jl")
 export configure!, autoeval!, ask, reset!, reindex!
 
 function __init__()
+    # CONFIG is constructed during precompilation, so its status_io field holds
+    # the precompile process's stderr — a dead handle in this process. Rebind it.
+    CONFIG.status_io = stderr
     try
         PT.load_api_keys!()
     catch e
