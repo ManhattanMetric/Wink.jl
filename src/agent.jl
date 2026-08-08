@@ -286,6 +286,14 @@ function textual_tool_call(text::AbstractString, tool_names)
     return name in tool_names ? name : nothing
 end
 
+# The recovery reflex, part 2 (part 1 is `api_hint`): spot blind retry streaks.
+# A failed eval_code renders as its error text — "ERROR: ..." or
+# "parse error: ..." from format_for_model, "TOOL ERROR: ..." from the loop's
+# own guard. Successful evals ("value: ...") and DECLINED never match.
+failed_eval_output(out::AbstractString) =
+    startswith(out, "ERROR") || startswith(out, "parse error:") ||
+    startswith(out, "TOOL ERROR")
+
 function _tally!(chat::Chat, msg)
     try
         chat.tokens_in += msg.tokens[1]
@@ -308,6 +316,7 @@ function run_turn!(chat::Chat, user_text::AbstractString;
         io::IO = CONFIG.status_io)
     push!(chat.history, PT.UserMessage(String(user_text)))
     tools = collect(values(chat.tool_map))
+    eval_fail_streak = 0    # consecutive failed eval_code calls, across rounds
     try
         for _ in 1:CONFIG.max_rounds
             msg = with_thinking(() -> _aitools_call(schema, chat.history, tools), io)
@@ -339,9 +348,24 @@ function run_turn!(chat::Chat, user_text::AbstractString;
             for c in calls
                 t0 = time()
                 out = execute_tool_call(chat.tool_map, c)
+                # Any successful eval, or any other tool call (introspection is
+                # exactly the compliance we want), breaks the streak.
+                eval_fail_streak = c.name == "eval_code" && failed_eval_output(out) ?
+                                   eval_fail_streak + 1 : 0
                 status(io,
                     "→ $(c.name)($(compact_args(c.args))) [$(round(time() - t0; digits = 1))s]")
                 push!(results, "<tool_result name=\"$(c.name)\">\n$(out)\n</tool_result>")
+            end
+            if eval_fail_streak >= 2
+                push!(results,
+                    "(system note: that is $(eval_fail_streak) consecutive " *
+                    "eval_code failures. Stop retrying variations — the API is " *
+                    "not what you remember. Before the next eval_code call, look " *
+                    "it up: get_doc and list_methods on the function involved, " *
+                    "or search_docs for the task. Introspection tools are ground " *
+                    "truth.)")
+                debug_status(io,
+                    "$(eval_fail_streak) consecutive eval failures; demanding introspection")
             end
             push!(chat.history, PT.UserMessage(join(results, "\n")))
         end

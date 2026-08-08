@@ -93,7 +93,35 @@ function format_for_model(r::EvalResult; limit::Integer = CONFIG.tool_output_lim
         truncate_output(r.error_text; limit))
     isempty(strip(r.output)) ||
         push!(parts, "stdout/stderr:\n" * truncate_output(r.output; limit))
+    if !r.ok
+        h = api_hint(r.error_text)
+        isempty(h) || push!(parts, h)
+    end
     return join(parts, "\n\n")
+end
+
+# The recovery reflex, part 1: when evaluation fails because the model imagined
+# an API — an undefined name, or a signature no method matches — the failure
+# itself points at Julia's introspection tools, naming the offending binding.
+# One mechanism covers every such gap (there is no per-API special casing;
+# the payload is the language's own discoverability). Part 2, the escalating
+# note on repeated failures, lives in the agent loop.
+function api_hint(error_text::AbstractString)
+    m = match(r"no method matching ([A-Za-z_!][A-Za-z0-9_!.]*)\(", error_text)
+    if m !== nothing
+        f = m.captures[1]
+        return "hint: that call signature for `$f` does not exist — do not guess " *
+               "another one. Look the API up first: get_doc(\"$f\") and " *
+               "list_methods(\"$f\") are ground truth."
+    end
+    m = match(r"UndefVarError: `?([A-Za-z_!@][A-Za-z0-9_!]*)`?", error_text)
+    if m !== nothing
+        n = m.captures[1]
+        return "hint: `$n` does not exist in this session — do not retry it. " *
+               "Find the real API with list_names(\"<topic>\") or search_docs, " *
+               "then confirm with get_doc before calling it."
+    end
+    return ""
 end
 
 """

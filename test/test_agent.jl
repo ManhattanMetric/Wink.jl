@@ -92,6 +92,36 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     end
     @test Main.WINK_AGENT_SENTINEL == 42
 
+    # --- recovery reflex: repeated eval failures escalate to an introspection
+    # demand. The echo replays the same failing eval every round (a blind retry
+    # streak); round 1 gets only the api_hint, rounds 2..3 add the system note.
+    schema6 = PT.TestEchoAnthropicSchema(;
+        response = anthropic_tool_response("eval_code",
+            Dict{Symbol, Any}(:code => "system(\"ls\")")),
+        status = 200)
+    chat6 = Wink.new_chat()
+    old_auto = Wink.CONFIG.autoeval
+    try
+        Wink.CONFIG.autoeval = true
+        Wink.CONFIG.max_rounds = 3
+        Wink.run_turn!(chat6, "list the files here"; schema = schema6, io = devnull)
+    finally
+        Wink.CONFIG.autoeval = old_auto
+        Wink.CONFIG.max_rounds = old_rounds
+    end
+    users6 = [m for m in chat6.history if m isa PT.UserMessage]
+    @test any(m -> occursin("hint: `system` does not exist", m.content), users6)
+    @test count(m -> occursin("consecutive eval_code failures", m.content),
+        users6) == 2
+    @test any(m -> occursin("3 consecutive", m.content), users6)
+
+    # streak accounting: only failed evals extend it, anything else resets
+    @test Wink.failed_eval_output("ERROR: MethodError: no method matching f()")
+    @test Wink.failed_eval_output("parse error: unexpected `)`")
+    @test Wink.failed_eval_output("TOOL ERROR: boom")
+    @test !Wink.failed_eval_output("value: 42")
+    @test !Wink.failed_eval_output(Wink.DECLINED_MSG)
+
     # --- thinking indicator: non-TTY path is a plain status line, result passes ---
     @test Wink.with_thinking(() -> 42, devnull) == 42
 

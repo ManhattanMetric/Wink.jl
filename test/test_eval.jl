@@ -41,6 +41,33 @@
     @test !occursin("value:", s)
 end
 
+@testset "recovery hints" begin
+    # imagined function (the transcript's `system("ls")`) → discovery nudge
+    r = Wink.eval_in_main("system(\"ls\")")
+    @test !r.ok
+    s = Wink.format_for_model(r)
+    @test occursin("hint:", s)
+    @test occursin("`system` does not exist", s)
+    @test occursin("list_names", s)
+
+    # imagined signature (the transcript's `run("ls")`) → nudge names the function
+    r = Wink.eval_in_main("run(\"ls\")")
+    @test !r.ok
+    s = Wink.format_for_model(r)
+    @test occursin("get_doc(\"run\")", s)
+    @test occursin("list_methods(\"run\")", s)
+
+    # successes and non-API errors carry no hint
+    @test !occursin("hint:", Wink.format_for_model(Wink.eval_in_main("1 + 1")))
+    @test !occursin("hint:",
+        Wink.format_for_model(Wink.eval_in_main("error(\"boom\")")))
+
+    # matching is on the error text, bang names included
+    @test occursin("push!",
+        Wink.api_hint("ERROR: MethodError: no method matching push!(::Int)"))
+    @test Wink.api_hint("ERROR: something else entirely") == ""
+end
+
 @testset "eval gate" begin
     old_confirm = Wink.CONFIG.confirm
     old_auto = Wink.CONFIG.autoeval
