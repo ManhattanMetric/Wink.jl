@@ -209,28 +209,12 @@ function execute_tool_call(tool_map::AbstractDict, c::PT.ToolMessage)
     return truncate_output(string(out))
 end
 
-# Model routing: resolve the alias, look the model up in PT's registry, and use
-# its schema class to decide provider-specific api_kwargs (Anthropic's default
-# max_tokens of 2048 is far too small for code generation).
-function _model_schema(model::AbstractString)
-    id = get(PT.MODEL_ALIASES, model, model)
-    spec = get(PT.MODEL_REGISTRY, id, nothing)
-    return spec === nothing ? nothing : spec.schema
-end
-
 function _aitools_call(schema, history, tools)
     sch = schema === nothing ? _model_schema(CONFIG.chat_model) : schema
-    api_kwargs = NamedTuple()
-    key_kwargs = NamedTuple()
-    if sch isa PT.AbstractAnthropicSchema
-        api_kwargs = (; max_tokens = CONFIG.max_tokens)
-    elseif sch isa Union{PT.CustomOpenAISchema, PT.LocalServerOpenAISchema}
-        isempty(CONFIG.chat_api_base) ||
-            (api_kwargs = (; url = CONFIG.chat_api_base))
-        # OpenAI.jl rejects an empty api key even though local servers ignore
-        # it; send a placeholder unless a real key is available as a fallback.
-        isempty(PT.OPENAI_API_KEY) && (key_kwargs = (; api_key = "wink-local"))
-    end
+    api_kwargs, key_kwargs = custom_server_kwargs(sch, CONFIG.chat_api_base)
+    # Anthropic's default max_tokens of 2048 is far too small for code generation.
+    sch isa PT.AbstractAnthropicSchema &&
+        (api_kwargs = (; max_tokens = CONFIG.max_tokens))
     kwargs = (; tools, model = CONFIG.chat_model, return_all = false,
         verbose = false, api_kwargs, key_kwargs...)
     return schema === nothing ? PT.aitools(history; kwargs...) :

@@ -35,6 +35,7 @@ Base.@kwdef mutable struct WinkConfig
     chat_model::String = ""
     chat_api_base::String = ""          # "" => provider default; else an OpenAI-compatible base URL
     embed_model::String = ""            # "" => no embedding backend; RAG degrades
+    embed_api_base::String = ""         # "" => provider default; else an OpenAI-compatible base URL
     autoeval::Bool = false
     confirm::Function = default_confirm # (kind::Symbol, text) -> Bool
     max_rounds::Int = 12
@@ -45,6 +46,26 @@ Base.@kwdef mutable struct WinkConfig
 end
 
 const CONFIG = WinkConfig()
+
+# Model routing: resolve the alias, look the model up in PT's registry, and
+# return its schema (nothing when unregistered).
+function _model_schema(model::AbstractString)
+    id = get(PT.MODEL_ALIASES, model, model)
+    spec = get(PT.MODEL_REGISTRY, id, nothing)
+    return spec === nothing ? nothing : spec.schema
+end
+
+# Shared routing for OpenAI-compatible custom servers: the url override, plus
+# the placeholder api key OpenAI.jl insists on even though such servers ignore
+# it. Returns (api_kwargs, key_kwargs) to splice into an ai* call; both empty
+# for ordinary provider schemas.
+function custom_server_kwargs(schema, api_base::AbstractString)
+    schema isa Union{PT.CustomOpenAISchema, PT.LocalServerOpenAISchema} ||
+        return NamedTuple(), NamedTuple()
+    api_kwargs = isempty(api_base) ? NamedTuple() : (; url = String(api_base))
+    key_kwargs = isempty(PT.OPENAI_API_KEY) ? (; api_key = "wink-local") : NamedTuple()
+    return api_kwargs, key_kwargs
+end
 
 const OLLAMA_CHAT_DEFAULT = "llama3.1"
 const OLLAMA_EMBED_DEFAULT = "nomic-embed-text"
@@ -84,7 +105,8 @@ end
 
 """
     configure!(; chat_model, chat_schema, chat_api_base, embed_model, embed_schema,
-                 autoeval, max_rounds, max_tokens, tool_output_limit, instructions) -> WinkConfig
+                 embed_api_base, autoeval, max_rounds, max_tokens, tool_output_limit,
+                 instructions) -> WinkConfig
 
 Override Wink's configuration. Model names unknown to PromptingTools' registry
 are registered when the matching `*_schema` is supplied (e.g.
@@ -92,15 +114,19 @@ are registered when the matching `*_schema` is supplied (e.g.
 without a schema an unknown name would route to the default (OpenAI) provider,
 so a warning is emitted.
 
-`chat_api_base` points chat requests at an OpenAI-compatible server (LM Studio,
-llama.cpp, vLLM, …), e.g.
+`chat_api_base` / `embed_api_base` point chat and embedding requests at an
+OpenAI-compatible server (LM Studio, llama.cpp, vLLM, …), e.g.
 
     configure!(chat_model = "prism-ml/bonsai-27b",
-               chat_api_base = "http://localhost:1234/v1")
+               chat_api_base = "http://localhost:1234/v1",
+               embed_model = "text-embedding-nomic-embed-text-v1.5",
+               embed_api_base = "http://localhost:1234/v1")
 
-An unknown `chat_model` is then auto-registered with `CustomOpenAISchema`, and
-when no `OPENAI_API_KEY` is set a placeholder key is sent (local servers accept
-any key). Pass `chat_api_base = ""` to return to the provider's default URL.
+An unknown model name given alongside its `*_api_base` is auto-registered with
+`CustomOpenAISchema`, and when no `OPENAI_API_KEY` is set a placeholder key is
+sent (local servers accept any key). Pass `"" ` for an `*_api_base` to return
+to the provider's default URL. After changing the embedding setup, run
+`Wink.reindex!()` (or `:reindex`) to rebuild the doc index with the new model.
 
 `instructions` sets session-level standing instructions for the model — they
 are appended to the system prompt alongside any global
@@ -110,21 +136,18 @@ or `:reset`).
 """
 function configure!(; chat_model = nothing, chat_schema = nothing,
         chat_api_base = nothing, embed_model = nothing, embed_schema = nothing,
-        autoeval = nothing, max_rounds = nothing, max_tokens = nothing,
-        tool_output_limit = nothing, instructions = nothing)
+        embed_api_base = nothing, autoeval = nothing, max_rounds = nothing,
+        max_tokens = nothing, tool_output_limit = nothing, instructions = nothing)
     chat_api_base === nothing || (CONFIG.chat_api_base = String(chat_api_base))
+    embed_api_base === nothing || (CONFIG.embed_api_base = String(embed_api_base))
     if chat_model !== nothing
-        schema = if chat_schema === nothing && !isempty(CONFIG.chat_api_base) &&
-                    !haskey(PT.MODEL_REGISTRY, String(chat_model))
-            PT.CustomOpenAISchema()
-        else
-            chat_schema
-        end
-        _adopt_model!(chat_model, schema, "chat_model")
+        _adopt_model!(chat_model,
+            _auto_schema(chat_model, chat_schema, CONFIG.chat_api_base), "chat_model")
         CONFIG.chat_model = String(chat_model)
     end
     if embed_model !== nothing
-        _adopt_model!(embed_model, embed_schema, "embed_model")
+        _adopt_model!(embed_model,
+            _auto_schema(embed_model, embed_schema, CONFIG.embed_api_base), "embed_model")
         CONFIG.embed_model = String(embed_model)
     end
     autoeval === nothing || (CONFIG.autoeval = Bool(autoeval))
@@ -134,6 +157,12 @@ function configure!(; chat_model = nothing, chat_schema = nothing,
     instructions === nothing || (CONFIG.instructions = String(instructions))
     return CONFIG
 end
+
+# An unknown model configured together with a custom base URL is meant for that
+# OpenAI-compatible server; register it as such rather than warning.
+_auto_schema(name, schema, api_base::AbstractString) =
+    schema === nothing && !isempty(api_base) &&
+    !haskey(PT.MODEL_REGISTRY, String(name)) ? PT.CustomOpenAISchema() : schema
 
 function _adopt_model!(name, schema, which::String)
     if schema !== nothing

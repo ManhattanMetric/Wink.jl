@@ -121,9 +121,17 @@ end
 
 chunk_embed_text(c::DocChunk) = string(c.binding, "\n", c.text)
 
+# All embedding traffic funnels through here so custom OpenAI-compatible
+# servers (CONFIG.embed_api_base) route the same way chat does.
+function _aiembed_call(docs, model::AbstractString)
+    api_kwargs, key_kwargs = custom_server_kwargs(
+        _model_schema(String(model)), CONFIG.embed_api_base)
+    return PT.aiembed(docs, LinearAlgebra.normalize; model = String(model),
+        verbose = false, api_kwargs, key_kwargs...)
+end
+
 function embed_query(model::AbstractString, query::AbstractString)
-    msg = PT.aiembed(String(first(query, 6000)), LinearAlgebra.normalize;
-        model = String(model), verbose = false)
+    msg = _aiembed_call(String(first(query, 6000)), model)
     return Float32.(msg.content)
 end
 
@@ -135,8 +143,7 @@ function embed_texts(texts::Vector{String}; model::AbstractString = CONFIG.embed
     for (bi, lo) in enumerate(1:batch:length(texts))
         hi = min(lo + batch - 1, length(texts))
         docs = String[first(t, 6000) for t in texts[lo:hi]]
-        msg = PT.aiembed(docs, LinearAlgebra.normalize;
-            model = String(model), verbose = false)
+        msg = _aiembed_call(docs, model)
         M = msg.content
         M isa AbstractVector && (M = reshape(Float32.(M), :, 1))
         for j in axes(M, 2)
@@ -179,8 +186,9 @@ end
 
 function build_index!(; io::IO = CONFIG.status_io)
     isempty(CONFIG.embed_model) &&
-        throw(WinkResolveError("no embedding provider configured (need " *
-                               "OPENAI_API_KEY or a local Ollama server)"))
+        throw(WinkResolveError("no embedding provider configured (set " *
+                               "OPENAI_API_KEY, run a local Ollama server, or " *
+                               "configure!(embed_model = ..., embed_api_base = ...))"))
     chunks = build_corpus()
     isempty(chunks) && throw(WinkResolveError("no documented bindings found to index"))
     status(io,
@@ -296,7 +304,8 @@ tool_search_docs(query::String, top_k::String) = tool_guard("search_docs") do
     k = clamp(something(tryparse(Int, strip(top_k)), 8), 1, 25)
     isempty(CONFIG.embed_model) &&
         return keyword_fallback(q,
-            "no embedding provider (need OPENAI_API_KEY or a local Ollama server)")
+            "no embedding provider (set OPENAI_API_KEY, run a local Ollama " *
+            "server, or configure!(embed_model = ..., embed_api_base = ...))")
     idx = ensure_index!()
     idx === nothing &&
         return keyword_fallback(q, something(INDEX_FAILURE[], "index build failed"))

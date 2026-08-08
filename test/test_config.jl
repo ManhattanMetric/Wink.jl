@@ -51,6 +51,14 @@
     Wink.configure!(chat_api_base = "")
     @test isempty(Wink.CONFIG.chat_api_base)
 
+    # ...and the same for embedding models via embed_api_base
+    @test_logs Wink.configure!(embed_model = "wink-local-embed-xyz",
+        embed_api_base = "http://localhost:1234/v1")
+    @test Wink.CONFIG.embed_api_base == "http://localhost:1234/v1"
+    @test PT.MODEL_REGISTRY["wink-local-embed-xyz"].schema isa PT.CustomOpenAISchema
+    Wink.configure!(embed_api_base = "")
+    @test isempty(Wink.CONFIG.embed_api_base)
+
     Wink.autoeval!(true)
     @test Wink.CONFIG.autoeval
     Wink.autoeval!(false)

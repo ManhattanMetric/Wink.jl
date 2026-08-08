@@ -132,6 +132,8 @@ function show_config(io::IO = stdout)
         println(io, "chat_api_base     = ", c.chat_api_base)
     println(io, "embed_model       = ",
         isempty(c.embed_model) ? "(none — keyword doc search only)" : c.embed_model)
+    isempty(c.embed_api_base) ||
+        println(io, "embed_api_base    = ", c.embed_api_base)
     println(io, "autoeval          = ", c.autoeval)
     println(io, "max_rounds        = ", c.max_rounds)
     println(io, "max_tokens        = ", c.max_tokens)
