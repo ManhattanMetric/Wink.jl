@@ -178,6 +178,9 @@ function system_prompt()
       of running one large blob. Your code affects the user's real session state.
     $(edit_rule)- If a tool result says DECLINED, the user said no: do not retry the same call;
       briefly explain what you intended or propose an alternative.
+    - The "→ tool(...)" lines in this transcript are records of tool calls already
+      made. Writing such a line as text runs nothing — invoke tools only through
+      the tool-calling interface.
     - Be concise. Put code in fenced blocks. When you changed session state, state
       exactly what changed.
     """
@@ -221,6 +224,19 @@ function _aitools_call(schema, history, tools)
            PT.aitools(schema, history; kwargs...)
 end
 
+# A no-tool-call reply whose final line mimics the transcript's "→ tool(...)"
+# gloss is an unexecuted intent, not an answer: small models imitate the
+# flattened history instead of using the tool-calling API. Returns the tool
+# name, or nothing when the text ends like a real answer.
+function textual_tool_call(text::AbstractString, tool_names)
+    lines = filter(!isempty, [strip(l) for l in split(text, '\n')])
+    isempty(lines) && return nothing
+    m = match(r"^(?:→|->)?\s*([A-Za-z_][A-Za-z0-9_!]*)\s*\(.*\)$", String(last(lines)))
+    m === nothing && return nothing
+    name = String(m.captures[1])
+    return name in tool_names ? name : nothing
+end
+
 function _tally!(chat::Chat, msg)
     try
         chat.tokens_in += msg.tokens[1]
@@ -252,6 +268,18 @@ function run_turn!(chat::Chat, user_text::AbstractString;
             if isempty(calls)
                 text = something(msg.content, "")
                 push!(chat.history, PT.AIMessage(text))
+                name = textual_tool_call(text, keys(chat.tool_map))
+                if name !== nothing
+                    push!(chat.history,
+                        PT.UserMessage("(system note: your message ended with " *
+                                       "\"$(name)(...)\" written as text, which runs " *
+                                       "nothing — the \"→ tool(...)\" lines in this " *
+                                       "transcript are records of calls already made. " *
+                                       "Invoke $(name) through the tool-calling " *
+                                       "interface to actually run it.)"))
+                    status(io, "… model wrote a tool call as text; asking for a real $(name) call")
+                    continue
+                end
                 return text
             end
             desc = join(("→ $(c.name)($(compact_args(c.args)))" for c in calls), "\n")

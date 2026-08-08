@@ -92,6 +92,36 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     end
     @test Main.WINK_AGENT_SENTINEL == 42
 
+    # --- textual tool-call detection (imitation of the flattened transcript) ---
+    tools = ("get_doc", "get_source", "eval_code")
+    @test Wink.textual_tool_call("Let me check:\n→ get_doc(name=\"sort\")", tools) ==
+          "get_doc"
+    @test Wink.textual_tool_call("-> get_source(signature=\"foo\")", tools) ==
+          "get_source"
+    @test Wink.textual_tool_call("get_doc(name=\"sort\")", tools) == "get_doc"
+    @test Wink.textual_tool_call("call notatool(x=1)", tools) === nothing
+    @test Wink.textual_tool_call("→ get_doc(...) told me sort sorts.", tools) === nothing
+    @test Wink.textual_tool_call("The answer is 42.", tools) === nothing
+    @test Wink.textual_tool_call("", tools) === nothing
+
+    # A reply ending in a textual call is nudged instead of accepted as final:
+    # the echo replays the same text every round, so the loop nudges once per
+    # round and then falls through to the forced-final path.
+    schema5 = PT.TestEchoAnthropicSchema(;
+        response = anthropic_text_response(
+            "No docstring — let me look:\n→ get_source(signature=\"Wink.build_index!\")"),
+        status = 200)
+    chat5 = Wink.new_chat()
+    try
+        Wink.CONFIG.max_rounds = 2
+        Wink.run_turn!(chat5, "where is the index stored?"; schema = schema5,
+            io = devnull)
+    finally
+        Wink.CONFIG.max_rounds = old_rounds
+    end
+    @test count(m -> m isa PT.UserMessage && occursin("written as text", m.content),
+        chat5.history) == 2
+
     # --- system prompt content ---
     sp = Wink.system_prompt()
     @test occursin(string(VERSION), sp)
