@@ -20,6 +20,7 @@ using TestPkg
     include("test_eval.jl")
     include("test_shell.jl")
     include("test_agent.jl")
+    include("test_compact.jl")
     include("test_repl.jl")
     include("test_edit.jl")
     include("test_rag.jl")

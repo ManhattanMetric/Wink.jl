@@ -39,9 +39,10 @@ include("shell.jl")
 include("edit.jl")
 include("rag.jl")
 include("agent.jl")
+include("compact.jl")
 include("repl.jl")
 
-export configure!, autoeval!, ask, reset!, reindex!, index_packages!
+export configure!, autoeval!, ask, reset!, compact!, reindex!, index_packages!
 
 function __init__()
     # CONFIG is constructed during precompilation, so its status_io field holds

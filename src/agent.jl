@@ -321,6 +321,7 @@ function run_turn!(chat::Chat, user_text::AbstractString;
         for _ in 1:CONFIG.max_rounds
             msg = with_thinking(() -> _aitools_call(schema, chat.history, tools), io)
             _tally!(chat, msg)
+            maybe_compact!(chat, msg, io)
             calls = msg.tool_calls
             if isempty(calls)
                 text = something(msg.content, "")

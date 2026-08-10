@@ -117,6 +117,8 @@ run code in this session. Meta-commands:
   :config         show current configuration
   :autoeval on|off  toggle confirmation-free execution of model code/shell/edits
   :debug on|off   show diagnostic status lines (model name, agent-loop notes)
+  :compact        fold stale re-derivable tool results out of the context
+                  (runs automatically past context_budget prompt tokens)
   :model [name]   show or set the chat model
   :prompt         show the system prompt a new conversation would get
   :reindex        (re)build the documentation search index
@@ -155,6 +157,10 @@ function handle_meta_command(cmd::AbstractString; io::IO = stdout)
             println(io, "usage: :debug on|off (currently ",
                 CONFIG.debug ? "on" : "off", ")")
         end
+    elseif head == ":compact"
+        n = compact!()
+        println(io, n == 0 ? "nothing to fold" :
+                    "folded $n stale tool result$(n == 1 ? "" : "s")")
     elseif head == ":model"
         if length(parts) >= 2
             configure!(chat_model = String(parts[2]))
@@ -196,6 +202,8 @@ function show_config(io::IO = stdout)
     println(io, "max_rounds        = ", c.max_rounds)
     println(io, "max_tokens        = ", c.max_tokens)
     println(io, "tool_output_limit = ", c.tool_output_limit)
+    println(io, "context_budget    = ",
+        c.context_budget == 0 ? "0 (auto-compaction off)" : c.context_budget)
     println(io, "debug             = ", c.debug)
     return nothing
 end

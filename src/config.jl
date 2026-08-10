@@ -43,6 +43,7 @@ Base.@kwdef mutable struct WinkConfig
     max_rounds::Int = 12
     max_tokens::Int = 8192
     tool_output_limit::Int = 4_000
+    context_budget::Int = 100_000       # soft prompt-token target; exceeding it triggers compaction (0 = off)
     status_io::IO = stderr
     debug::Bool = false                 # show diagnostic status lines (model name, loop notes)
     instructions::String = ""           # session-level standing instructions
@@ -109,7 +110,7 @@ end
 """
     configure!(; chat_model, chat_schema, chat_api_base, embed_model, embed_schema,
                  embed_api_base, autoeval, max_rounds, max_tokens, tool_output_limit,
-                 instructions) -> WinkConfig
+                 context_budget, instructions) -> WinkConfig
 
 Override Wink's configuration. Model names unknown to PromptingTools' registry
 are registered when the matching `*_schema` is supplied (e.g.
@@ -136,12 +137,19 @@ are appended to the system prompt alongside any global
 (`~/.julia/config/wink.md`) and per-project (`.wink.md`) instruction files.
 Prompt changes take effect when the next conversation starts (`Wink.reset!()`
 or `:reset`).
+
+`context_budget` is a soft target for prompt tokens, not the model's hard
+window: when a round's reported prompt size exceeds it, Wink folds stale
+re-derivable tool results out of the history (see [`compact!`](@ref)). Set it
+well below the model's usable window — long contexts degrade attention,
+especially on small local models, before they overflow. `0` disables
+auto-compaction.
 """
 function configure!(; chat_model = nothing, chat_schema = nothing,
         chat_api_base = nothing, embed_model = nothing, embed_schema = nothing,
         embed_api_base = nothing, autoeval = nothing, max_rounds = nothing,
-        max_tokens = nothing, tool_output_limit = nothing, instructions = nothing,
-        debug = nothing)
+        max_tokens = nothing, tool_output_limit = nothing,
+        context_budget = nothing, instructions = nothing, debug = nothing)
     chat_api_base === nothing || (CONFIG.chat_api_base = String(chat_api_base))
     embed_api_base === nothing || (CONFIG.embed_api_base = String(embed_api_base))
     if chat_model !== nothing
@@ -158,6 +166,7 @@ function configure!(; chat_model = nothing, chat_schema = nothing,
     max_rounds === nothing || (CONFIG.max_rounds = Int(max_rounds))
     max_tokens === nothing || (CONFIG.max_tokens = Int(max_tokens))
     tool_output_limit === nothing || (CONFIG.tool_output_limit = Int(tool_output_limit))
+    context_budget === nothing || (CONFIG.context_budget = Int(context_budget))
     instructions === nothing || (CONFIG.instructions = String(instructions))
     debug === nothing || (CONFIG.debug = Bool(debug))
     return CONFIG
