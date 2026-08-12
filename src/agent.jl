@@ -131,6 +131,9 @@ function system_prompt()
                 """
                 - Before edit_file: call where_defined, then read_file to copy the exact
                   current text for old_string. Never construct an edit from memory.
+                - New files are created with write_file, existing ones changed with
+                  edit_file — never with open/write inside eval_code: file changes must
+                  pass through the file tools' confirmation gates.
                 """ : ""
     base = """
     You are Wink, an AI pair-programmer living INSIDE the user's running Julia

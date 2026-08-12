@@ -135,7 +135,9 @@ be called (verify with list_names or get_doc when unsure). For shell commands
 (git, mkdir, curl, anything you would type in a terminal) use the run_shell
 tool instead of eval_code: Julia has no `system()`, `run` accepts only
 backtick command literals — never plain strings or vectors — and a backtick
-literal by itself constructs a command without running it. It runs with REPL
+literal by itself constructs a command without running it. Likewise, never
+create or modify files with open/write here — use write_file (new files) and
+edit_file (existing files) instead. It runs with REPL
 semantics (soft scope), so write it exactly as you would type it at the `julia>` prompt;
 definitions, variables, and side effects persist for both you and the user.
 Unless auto-approval is on, the user is shown the code first and may decline —

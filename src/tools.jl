@@ -268,6 +268,11 @@ end
 
 # ---- read perimeter ----------------------------------------------------------
 
+# Plain-text file types Wink will read (read_file) or create (write_file).
+# edit_file stays .jl-only: its Revise round-trip only makes sense for source.
+const TEXT_FILE_EXTS = (".jl", ".toml", ".md", ".txt", ".html", ".css", ".js",
+    ".json")
+
 realpath_or(p::AbstractString) = try
     realpath(p)
 catch
@@ -304,8 +309,9 @@ function readable_path(path::AbstractString)
     any(Base.Fix1(under, p), read_roots()) ||
         throw(WinkResolveError("`$p` is outside the readable perimeter (the active " *
                                "project, loaded packages, and Julia's source tree)"))
-    any(endswith(p, ext) for ext in (".jl", ".toml", ".md", ".txt")) ||
-        throw(WinkResolveError("only .jl/.toml/.md/.txt files can be read"))
+    any(endswith(p, ext) for ext in TEXT_FILE_EXTS) ||
+        throw(WinkResolveError("only these file types can be read: " *
+                               join(TEXT_FILE_EXTS, ", ")))
     return p
 end
 

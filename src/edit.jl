@@ -133,3 +133,59 @@ tool_edit_file(path::String, old_string::String, new_string::String) =
     end
 
 push!(TOOL_SPECS, "edit_file" => tool_edit_file)
+
+# ---- file creation -----------------------------------------------------------
+
+# Perimeter check for a path that does not exist yet: resolve symlinks through
+# the nearest existing ancestor, then re-append the uncreated remainder, so a
+# not-yet-created path cannot dodge the check that edit_file's realpath does.
+function writable_new_path(path::AbstractString)
+    isempty(strip(path)) && throw(WinkResolveError("path is empty"))
+    p = abspath(expanduser(strip(path)))
+    ispath(p) &&
+        throw(WinkResolveError("`$p` already exists — write_file only creates " *
+                               "new files; read_file it and use edit_file to change it"))
+    any(endswith(p, ext) for ext in TEXT_FILE_EXTS) ||
+        throw(WinkResolveError("only these file types can be written: " *
+                               join(TEXT_FILE_EXTS, ", ")))
+    anc, rest = dirname(p), basename(p)
+    while !isdir(anc)
+        parent = dirname(anc)
+        parent == anc && break
+        rest = joinpath(basename(anc), rest)
+        anc = parent
+    end
+    resolved = joinpath(realpath_or(anc), rest)
+    any(Base.Fix1(under, resolved), edit_roots()) ||
+        throw(WinkResolveError("`$p` is outside the editable perimeter (the " *
+                               "active project and packages under development)"))
+    return resolved
+end
+
+"""
+    write_file(path::String, content::String) -> String
+
+Create a NEW text file with the given content — the way to add source files,
+templates, and assets to the project. It refuses to overwrite: if the file
+already exists, read_file it and use edit_file to change it. Parent
+directories are created as needed. Writing is limited to the active project
+and packages loaded for development, and to plain-text types (.jl, .toml,
+.md, .txt, .html, .css, .js, .json). Never create files with open/write
+inside eval_code — file changes must go through this tool so the user sees
+the full content at the confirmation gate. Creating a file does not load it:
+if the session should use its code, include it (or `using`/`import`) in a
+separate step.
+"""
+tool_write_file(path::String, content::String) = tool_guard("write_file") do
+    isempty(strip(content)) && throw(WinkResolveError("content is empty"))
+    p = writable_new_path(path)
+    CONFIG.autoeval || CONFIG.confirm(:write, "new file: $p\n\n" * content) ||
+        return DECLINED_MSG
+    mkpath(dirname(p))
+    write(p, content)
+    nlines = count(==('\n'), content) + (endswith(content, '\n') ? 0 : 1)
+    "OK: created $p ($nlines lines). The file is not loaded into the session; " *
+    "include it or extend the project's module if its code should run."
+end
+
+push!(TOOL_SPECS, "write_file" => tool_write_file)

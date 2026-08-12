@@ -55,6 +55,65 @@
         Wink.tool_edit_file("/no/such/wink_file.jl", "a", "b"))
 end
 
+@testset "write_file" begin
+    old_confirm = Wink.CONFIG.confirm
+    mktempdir() do dir
+        push!(Wink.EXTRA_EDIT_ROOTS, realpath(dir))
+        try
+            # the gate sees the path and full content under kind :write
+            seen = Ref{Any}(nothing)
+            Wink.CONFIG.confirm = (k, t) -> (seen[] = (k, t); true)
+            target = joinpath(dir, "src", "Models.jl")
+            out = Wink.tool_write_file(target, "module Models\nend\n")
+            @test startswith(out, "OK")
+            @test occursin("2 lines", out)
+            @test read(target, String) == "module Models\nend\n"   # mkpath worked
+            @test seen[][1] === :write
+            @test occursin("Models.jl", seen[][2])
+            @test occursin("module Models", seen[][2])
+
+            # refuses to overwrite, pointing at edit_file
+            out = Wink.tool_write_file(target, "something else")
+            @test occursin("already exists", out)
+            @test occursin("edit_file", out)
+            @test read(target, String) == "module Models\nend\n"
+
+            # non-source text types are allowed (assets need creating too)
+            @test startswith(Wink.tool_write_file(joinpath(dir, "static", "app.css"),
+                    "body { margin: 0 }\n"), "OK")
+
+            # disallowed extension
+            @test occursin("file types",
+                Wink.tool_write_file(joinpath(dir, "blob.bin"), "x"))
+
+            # empty content refused
+            @test occursin("content is empty",
+                Wink.tool_write_file(joinpath(dir, "empty.jl"), "  \n"))
+
+            # declined → nothing written
+            Wink.CONFIG.confirm = (k, t) -> false
+            declined = joinpath(dir, "declined.jl")
+            @test Wink.tool_write_file(declined, "f() = 1\n") == Wink.DECLINED_MSG
+            @test !isfile(declined)
+        finally
+            Wink.CONFIG.confirm = old_confirm
+            pop!(Wink.EXTRA_EDIT_ROOTS)
+        end
+
+        # outside the perimeter once the root is popped
+        Wink.CONFIG.confirm = (k, t) -> true
+        try
+            @test occursin("outside the editable perimeter",
+                Wink.tool_write_file(joinpath(dir, "outside.jl"), "f() = 1\n"))
+        finally
+            Wink.CONFIG.confirm = old_confirm
+        end
+    end
+
+    # registered as a model-facing tool
+    @test Wink.has_tool("write_file")
+end
+
 # End-to-end: edit a Revise-tracked file and observe the redefinition live.
 # Watcher timing can be flaky on shared CI runners — skippable via env.
 if get(ENV, "WINK_SKIP_REVISE_E2E", "") != "true"
