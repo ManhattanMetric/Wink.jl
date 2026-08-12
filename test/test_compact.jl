@@ -50,6 +50,76 @@
     @test Wink.compact!() == 0
 end
 
+@testset "compact distill" begin
+    # a plausible flattened history: system, then turns of user/ai pairs
+    mkhist(n) = begin
+        h = PT.AbstractMessage[PT.SystemMessage("sys"), PT.UserMessage("build a blog")]
+        while length(h) < n
+            push!(h, PT.AIMessage("→ eval_code(...)"))
+            push!(h, PT.UserMessage("<tool_result name=\"eval_code\">\nok\n</tool_result>"))
+        end
+        h
+    end
+
+    # span selection: cut lands so the first kept message is an AIMessage
+    h = mkhist(14)
+    r = Wink.distill_span(h; keep_recent = 6)
+    @test r == 2:8
+    @test h[first(r) - 1] isa PT.SystemMessage
+    @test h[last(r) + 1] isa PT.AIMessage
+
+    # too-small histories refuse to distill (this is also the cooldown)
+    @test Wink.distill_span(mkhist(8); keep_recent = 6) === nothing
+    @test Wink.distill_span(PT.AbstractMessage[PT.SystemMessage("sys")]) === nothing
+
+    # rendering labels roles
+    txt = Wink.render_span(h, 2:3)
+    @test occursin("[user]\nbuild a blog", txt)
+    @test occursin("[assistant]", txt)
+
+    # a successful distillation splices the brief in place of the span
+    brief_schema = PT.TestEchoAnthropicSchema(;
+        response = anthropic_text_response(
+            "Goal: a blog. Done: nothing durable. Decisions: plain repo over " *
+            "package. Open: scaffold layout."),
+        status = 200)
+    chat = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    @test Wink.distill_history!(chat; schema = brief_schema, io = devnull)
+    @test length(chat.history) == 14 - 7 + 1
+    @test chat.history[1] isa PT.SystemMessage
+    @test occursin("session brief", chat.history[2].content)
+    @test occursin("plain repo over package", chat.history[2].content)
+    @test chat.history[3] isa PT.AIMessage      # alternation survives the splice
+    @test chat.tokens_in > 0                    # the distill call is tallied
+
+    # an empty brief leaves the history untouched
+    empty_schema = PT.TestEchoAnthropicSchema(;
+        response = anthropic_text_response(""), status = 200)
+    chat2 = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    @test !Wink.distill_history!(chat2; schema = empty_schema, io = devnull)
+    @test length(chat2.history) == 14
+
+    # escalation policy: a productive fold defers distillation to a later round
+    over = PT.AIMessage(; content = "x", tokens = (200_000, 1))
+    long = repeat("x", 300)
+    h3 = mkhist(14)
+    h3[4] = PT.UserMessage("<tool_result name=\"get_doc\">\n$long\n</tool_result>")
+    chat3 = Wink.Chat(h3, Wink.build_tool_map(), 0, 0)
+    old_budget = Wink.CONFIG.context_budget
+    try
+        Wink.CONFIG.context_budget = 1_000
+        Wink.maybe_compact!(chat3, over, devnull; schema = brief_schema)
+        @test occursin("elided", chat3.history[4].content)      # folded...
+        @test length(chat3.history) == 14                       # ...not distilled
+        Wink.maybe_compact!(chat3, over, devnull; schema = brief_schema)
+        @test any(m -> m isa PT.UserMessage && occursin("session brief", m.content),
+            chat3.history)                                      # now distilled
+        @test length(chat3.history) < 14
+    finally
+        Wink.CONFIG.context_budget = old_budget
+    end
+end
+
 @testset "compact trigger" begin
     # The echo replays a get_doc call whose usage reports a prompt far over
     # budget, so every round triggers maybe_compact!; once more results exist

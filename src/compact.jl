@@ -1,4 +1,4 @@
-# Context compaction — tier 0: the deterministic "fold" pass.
+# Context compaction, tiers 0 (fold) and 1 (distill).
 #
 # Most of a long session's context is tool results that are pure functions of
 # the live session — source listings, method tables, docstrings. The session
@@ -10,8 +10,8 @@
 # which are historical facts. The trigger compares each round's
 # provider-reported prompt tokens against CONFIG.context_budget — a soft
 # target, deliberately far below any model's hard window: pressure against it
-# is treated as a signal, not an emergency. Later tiers (narrative
-# distillation, abstraction mining) will build on this pass.
+# is treated as a signal, not an emergency. Tier 2 (gated abstraction
+# mining) is planned on top of these two passes.
 
 # Allowlist, not a blocklist: a tool must be known-pure to be foldable, so new
 # tools default to being kept.
@@ -85,9 +85,110 @@ function compact!(; keep_recent::Integer = 2)
     return fold_history!(chat.history; keep_recent)
 end
 
+# ---- tier 1: distill ---------------------------------------------------------
+#
+# What survives folding is the non-re-derivable residue: intent, decisions and
+# their rationale, rejected approaches, task state. When the context is still
+# over budget after folding has nothing left to give, a one-shot model pass
+# distills the oldest span of the conversation into a compact brief that
+# replaces it. The brief records only what the session cannot: code and docs
+# are named, never restated, because introspection re-derives them as ground
+# truth. Distilling can incorporate an earlier brief into the new one, so
+# repeated passes are progressive, not destructive.
+
+const DISTILL_WORD_LIMIT = 400
+const DISTILL_KEEP_RECENT = 6     # messages never distilled (the live tail)
+const DISTILL_MIN_SPAN = 6        # smaller spans aren't worth a model call —
+                                  # and this is the cooldown: a fresh brief
+                                  # plus a few rounds stays below it
+
+const DISTILL_PROMPT = """
+You are compacting the transcript of an AI pair-programming session running
+inside a live Julia REPL. Your summary will REPLACE the transcript span you
+are given: whatever you do not record is gone — EXCEPT that everything alive
+in the session (definitions, types, docstrings, files) can be re-derived
+later with introspection tools, so never restate code or documentation: name
+it. Record, in this order, only what cannot be re-derived:
+- Goal: what the user is building or learning; constraints and preferences
+  they stated.
+- Done: names and locations of definitions created or files edited; session
+  state changed (packages added, data loaded, commands run).
+- Decisions: choices made and why — especially approaches tried and REJECTED,
+  and why, which is unrecoverable once this span is gone.
+- Open: unfinished work; what was about to happen next.
+Plain prose under those four labels, at most $(DISTILL_WORD_LIMIT) words
+total, no code blocks.
+"""
+
+const BRIEF_HEADER = "(session brief — the earlier conversation was compacted " *
+                     "into this summary; definitions it names are live in the " *
+                     "session and re-derivable with introspection tools)"
+
+# The distillable span: everything after the system prompt, protecting the
+# most recent keep_recent messages, with the cut walked back so the first
+# message kept after the brief is an AIMessage — the brief is a user message,
+# and user/assistant alternation must survive the splice.
+function distill_span(history::AbstractVector; keep_recent::Integer = DISTILL_KEEP_RECENT)
+    hi = length(history) - keep_recent
+    while hi >= 2 && !(history[hi + 1] isa PT.AIMessage)
+        hi -= 1
+    end
+    (hi >= 2 && hi - 1 >= DISTILL_MIN_SPAN) || return nothing
+    return 2:hi
+end
+
+function render_span(history::AbstractVector, r::AbstractRange)
+    parts = String[]
+    for m in history[r]
+        role = m isa PT.UserMessage ? "user" :
+               m isa PT.AIMessage ? "assistant" : "system"
+        push!(parts, "[$role]\n$(m.content)")
+    end
+    return join(parts, "\n\n")
+end
+
+"""
+    distill_history!(chat::Chat; schema = nothing, io = CONFIG.status_io,
+                     keep_recent = DISTILL_KEEP_RECENT) -> Bool
+
+Tier-1 compaction: replace the oldest span of the conversation with a model-
+written brief of its non-re-derivable content (goal, work done, decisions and
+rejected approaches, open threads). On any failure — the call erroring, or an
+empty brief — the history is left untouched. Returns whether a distillation
+happened.
+"""
+function distill_history!(chat::Chat; schema = nothing, io::IO = CONFIG.status_io,
+        keep_recent::Integer = DISTILL_KEEP_RECENT)
+    r = distill_span(chat.history; keep_recent)
+    r === nothing && return false
+    # The span fits the model's hard window even though it broke the soft
+    # budget: budget << window by design, and folding already ran.
+    span_text = render_span(chat.history, r)
+    brief = try
+        msgs = PT.AbstractMessage[PT.SystemMessage(DISTILL_PROMPT),
+            PT.UserMessage(span_text)]
+        m = _aitools_call(schema, msgs, PT.AbstractTool[])
+        _tally!(chat, m)
+        String(strip(something(m.content, "")))
+    catch e
+        e isa InterruptException && rethrow()
+        debug_status(io, "distillation call failed: $(sprint(showerror, e))")
+        return false
+    end
+    isempty(brief) && return false
+    replaced = length(r)
+    splice!(chat.history, r, [PT.UserMessage(BRIEF_HEADER * "\n\n" * brief)])
+    status(io, "distilled $replaced messages into a session brief")
+    return true
+end
+
+# ---- trigger -----------------------------------------------------------------
+
 # Called once per agent round with that round's reply, whose token counts are
-# the provider's own report of the prompt we just sent.
-function maybe_compact!(chat, msg, io::IO)
+# the provider's own report of the prompt we just sent. Escalation ladder:
+# fold first; only when a fold yields nothing (so its savings, if any, have
+# already been reflected in a later token report) does distillation run.
+function maybe_compact!(chat, msg, io::IO; schema = nothing)
     budget = CONFIG.context_budget
     budget > 0 || return nothing
     prompt_tokens = try
@@ -100,9 +201,11 @@ function maybe_compact!(chat, msg, io::IO)
     if folded > 0
         status(io, "context at $prompt_tokens tokens (budget $budget): " *
                    "folded $folded stale tool results")
-    else
-        debug_status(io, "context at $prompt_tokens tokens exceeds budget " *
-                         "$budget but nothing is foldable (tiers 1-2 not yet implemented)")
+        return nothing
     end
+    distill_history!(chat; schema, io) ||
+        debug_status(io, "context at $prompt_tokens tokens exceeds budget " *
+                         "$budget; nothing to fold and span too small to " *
+                         "distill (tier 2 not yet implemented)")
     return nothing
 end
