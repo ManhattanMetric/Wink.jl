@@ -23,46 +23,39 @@ const FOLDABLE_TOOLS = Set(["list_methods", "methods_with", "get_source",
 # Bodies at or below this length stay: the elision line would save nothing.
 const FOLD_MIN_CHARS = 200
 
-const FOLD_BLOCK_RE = r"<tool_result name=\"([A-Za-z_!]+)\">\n(.*?)\n</tool_result>"s
-
 """
-    fold_message(content) -> (folded_content::String, count::Int)
+    fold_result!(m::PT.ToolMessage) -> Bool
 
-Fold the re-derivable tool-result blocks inside one flattened tool-result
-message, leaving mutating tools' results and short bodies intact.
+Fold one tool-result message in place when its tool is re-derivable and its
+body long enough to be worth eliding. Mutating tools' results and short
+bodies are left intact; an already-elided result is short, so a second pass
+never re-folds.
 """
-function fold_message(content::AbstractString)
-    count = Ref(0)
-    out = replace(String(content), FOLD_BLOCK_RE => function (block)
-        m = match(FOLD_BLOCK_RE, block)
-        name, body = m.captures
-        (name in FOLDABLE_TOOLS && length(body) > FOLD_MIN_CHARS) || return block
-        count[] += 1
-        return "<tool_result name=\"$name\">\n(elided during context " *
-               "compaction — $name output is re-derivable; call it again for " *
-               "current ground truth)\n</tool_result>"
-    end)
-    return out, count[]
+function fold_result!(m::PT.ToolMessage)
+    name = something(m.name, "")
+    body = m.content isa AbstractString ? m.content :
+           string(something(m.content, ""))
+    (name in FOLDABLE_TOOLS && length(body) > FOLD_MIN_CHARS) || return false
+    m.content = "(elided during context compaction — $name output is " *
+                "re-derivable; call it again for current ground truth)"
+    return true
 end
 
-is_tool_result_msg(m) = m isa PT.UserMessage && startswith(m.content, "<tool_result")
+is_tool_result_msg(m) = m isa PT.ToolMessage
 
 """
     fold_history!(history; keep_recent = 2) -> Int
 
-Apply [`fold_message`](@ref) to every tool-result message in `history` except
+Apply [`fold_result!`](@ref) to every tool-result message in `history` except
 the most recent `keep_recent` of them (the model may still be reacting to
-those). Returns the number of folded result blocks.
+those). Returns the number of folded results.
 """
 function fold_history!(history::AbstractVector; keep_recent::Integer = 2)
     idxs = [i for i in eachindex(history) if is_tool_result_msg(history[i])]
     length(idxs) <= keep_recent && return 0
     folded = 0
     for i in idxs[1:(end - keep_recent)]
-        content, n = fold_message(history[i].content)
-        n == 0 && continue
-        history[i] = PT.UserMessage(content)
-        folded += n
+        fold_result!(history[i]) && (folded += 1)
     end
     return folded
 end
@@ -126,11 +119,13 @@ const BRIEF_HEADER = "(session brief — the earlier conversation was compacted 
 
 # The distillable span: everything after the system prompt, protecting the
 # most recent keep_recent messages, with the cut walked back so the first
-# message kept after the brief is an AIMessage — the brief is a user message,
-# and user/assistant alternation must survive the splice.
+# message kept after the brief is an assistant message (AIMessage or
+# AIToolRequest). The brief is a user message, so this keeps role alternation
+# intact for the Anthropic projection AND guarantees no ToolMessage is
+# orphaned from the AIToolRequest that requested it.
 function distill_span(history::AbstractVector; keep_recent::Integer = DISTILL_KEEP_RECENT)
     hi = length(history) - keep_recent
-    while hi >= 2 && !(history[hi + 1] isa PT.AIMessage)
+    while hi >= 2 && !(history[hi + 1] isa Union{PT.AIMessage, PT.AIToolRequest})
         hi -= 1
     end
     (hi >= 2 && hi - 1 >= DISTILL_MIN_SPAN) || return nothing
@@ -140,9 +135,20 @@ end
 function render_span(history::AbstractVector, r::AbstractRange)
     parts = String[]
     for m in history[r]
-        role = m isa PT.UserMessage ? "user" :
-               m isa PT.AIMessage ? "assistant" : "system"
-        push!(parts, "[$role]\n$(m.content)")
+        if m isa PT.ToolMessage
+            push!(parts, "[tool result: $(something(m.name, "?"))]\n" *
+                         string(something(m.content, "")))
+        elseif m isa PT.AIToolRequest
+            desc = join(("→ $(c.name)($(compact_args(c.args)))"
+                         for c in m.tool_calls), "\n")
+            preface = something(m.content, "")
+            push!(parts, "[assistant]\n" *
+                         (isempty(preface) ? desc : preface * "\n" * desc))
+        else
+            role = m isa PT.UserMessage ? "user" :
+                   m isa PT.AIMessage ? "assistant" : "system"
+            push!(parts, "[$role]\n$(m.content)")
+        end
     end
     return join(parts, "\n\n")
 end

@@ -1,20 +1,26 @@
 # Conversation state and the agentic tool loop.
 #
-# IMPORTANT DESIGN CONSTRAINT: PromptingTools' Anthropic renderer silently drops
-# `AIToolRequest`/`ToolMessage` entries when re-rendering a conversation (its
-# render pass only handles system/user/ai messages), so the documented
-# "push the tool message back into the conversation" pattern never round-trips
-# tool results to Claude. Wink therefore keeps the history as plain
-# System/User/AIMessage entries only, flattening each tool exchange into text:
-# the assistant's calls become an AIMessage, and the tool results go back as a
-# single UserMessage wrapped in <tool_result> blocks. This renders correctly on
-# every provider.
+# The history is stored NATIVELY: tool exchanges live as `AIToolRequest` (the
+# assistant's calls) and `ToolMessage` (each result, keyed by tool_call_id).
+# PromptingTools' OpenAI-compatible renderer round-trips both correctly, so on
+# that path the provider's own chat template formats past tool calls — nothing
+# in the transcript looks like text the model could imitate.
+#
+# PROVIDER EXCEPTION: PT's Anthropic renderer (as of the 0.94 pin) silently
+# drops `AIToolRequest`/`ToolMessage` when re-rendering a conversation (its
+# render pass only handles system/user/ai messages). For Anthropic schemas
+# only, `flatten_history` projects the native history into plain text at
+# render time: calls become "→ tool(...)" gloss lines on an AIMessage, results
+# a UserMessage of <tool_result> blocks. Storage is never flattened. Once the
+# planned upstream PR teaches PT's Anthropic renderer tool messages, delete
+# `flatten_history` and the projection branch in `_aitools_call`.
 
 """
     Chat
 
-Conversation state for one Wink session: the (flattened) message history, the
-tool registry, and cumulative token counts.
+Conversation state for one Wink session: the native message history (tool
+exchanges as `AIToolRequest`/`ToolMessage`), the tool registry, and cumulative
+token counts.
 """
 mutable struct Chat
     history::Vector{PT.AbstractMessage}
@@ -252,6 +258,35 @@ function compact_args(args)
     return join(parts, ", ")
 end
 
+# Render-time projection for providers whose PromptingTools renderer drops
+# tool messages (see the header comment). Consecutive user-role content is
+# merged so role alternation survives (tool results followed by a system
+# note, say). Delete once PT's Anthropic renderer learns tool messages.
+function flatten_history(history::AbstractVector)
+    out = PT.AbstractMessage[]
+    push_user! = text -> if !isempty(out) && out[end] isa PT.UserMessage
+        out[end] = PT.UserMessage(out[end].content * "\n" * text)
+    else
+        push!(out, PT.UserMessage(text))
+    end
+    for m in history
+        if m isa PT.ToolMessage
+            push_user!("<tool_result name=\"$(something(m.name, "?"))\">\n" *
+                       "$(string(something(m.content, "")))\n</tool_result>")
+        elseif m isa PT.AIToolRequest
+            desc = join(("→ $(c.name)($(compact_args(c.args)))"
+                         for c in m.tool_calls), "\n")
+            preface = something(m.content, "")
+            push!(out, PT.AIMessage(isempty(preface) ? desc : preface * "\n" * desc))
+        elseif m isa PT.UserMessage
+            push_user!(m.content)
+        else
+            push!(out, m)
+        end
+    end
+    return out
+end
+
 function execute_tool_call(tool_map::AbstractDict, c::PT.ToolMessage)
     out = try
         PT.execute_tool(tool_map, c; throw_on_error = false)
@@ -270,10 +305,13 @@ function _aitools_call(schema, history, tools)
     # Anthropic's default max_tokens of 2048 is far too small for code generation.
     sch isa PT.AbstractAnthropicSchema &&
         (api_kwargs = (; max_tokens = CONFIG.max_tokens))
+    # Projection point for the renderer gap (see header comment): Anthropic
+    # schemas get a flattened view; everyone else gets the native history.
+    msgs = sch isa PT.AbstractAnthropicSchema ? flatten_history(history) : history
     kwargs = (; tools, model = CONFIG.chat_model, return_all = false,
         verbose = false, api_kwargs, key_kwargs...)
-    return schema === nothing ? PT.aitools(history; kwargs...) :
-           PT.aitools(schema, history; kwargs...)
+    return schema === nothing ? PT.aitools(msgs; kwargs...) :
+           PT.aitools(schema, msgs; kwargs...)
 end
 
 # A no-tool-call reply that ends by imitating the transcript's "→ tool(...)"
@@ -361,11 +399,7 @@ function run_turn!(chat::Chat, user_text::AbstractString;
                 end
                 return text
             end
-            desc = join(("→ $(c.name)($(compact_args(c.args)))" for c in calls), "\n")
-            preface = something(msg.content, "")
-            push!(chat.history,
-                PT.AIMessage(isempty(preface) ? desc : preface * "\n" * desc))
-            results = String[]
+            push!(chat.history, msg)   # the AIToolRequest itself, calls included
             for c in calls
                 t0 = time()
                 out = execute_tool_call(chat.tool_map, c)
@@ -375,20 +409,22 @@ function run_turn!(chat::Chat, user_text::AbstractString;
                                    eval_fail_streak + 1 : 0
                 status(io,
                     "→ $(c.name)($(compact_args(c.args))) [$(round(time() - t0; digits = 1))s]")
-                push!(results, "<tool_result name=\"$(c.name)\">\n$(out)\n</tool_result>")
+                push!(chat.history,
+                    PT.ToolMessage(; content = out, tool_call_id = c.tool_call_id,
+                        raw = c.raw, name = c.name, args = c.args))
             end
             if eval_fail_streak >= 2
-                push!(results,
-                    "(system note: that is $(eval_fail_streak) consecutive " *
-                    "eval_code failures. Stop retrying variations — the API is " *
-                    "not what you remember. Before the next eval_code call, look " *
-                    "it up: get_doc and list_methods on the function involved, " *
-                    "or search_docs for the task. Introspection tools are ground " *
-                    "truth.)")
+                push!(chat.history,
+                    PT.UserMessage("(system note: that is $(eval_fail_streak) " *
+                                   "consecutive eval_code failures. Stop retrying " *
+                                   "variations — the API is not what you remember. " *
+                                   "Before the next eval_code call, look it up: " *
+                                   "get_doc and list_methods on the function " *
+                                   "involved, or search_docs for the task. " *
+                                   "Introspection tools are ground truth.)"))
                 debug_status(io,
                     "$(eval_fail_streak) consecutive eval failures; demanding introspection")
             end
-            push!(chat.history, PT.UserMessage(join(results, "\n")))
         end
         # Round cap reached: force a final, tool-free answer.
         debug_status(io, "tool-round limit reached; asking for a final answer")
@@ -419,7 +455,7 @@ ask(text::AbstractString) = run_turn!(current_chat(), text)
 """
     history(io::IO = stdout)
 
-Pretty-print the global chat's (flattened) message history and token totals.
+Pretty-print the global chat's message history and token totals.
 """
 function history(io::IO = stdout)
     chat = CHAT[]
@@ -428,11 +464,23 @@ function history(io::IO = stdout)
         return nothing
     end
     for msg in chat.history
-        role = msg isa PT.SystemMessage ? "system" :
-               msg isa PT.UserMessage ? "user" : "assistant"
+        role, body = if msg isa PT.SystemMessage
+            "system", msg.content
+        elseif msg isa PT.UserMessage
+            "user", msg.content
+        elseif msg isa PT.ToolMessage
+            "tool: $(something(msg.name, "?"))", string(something(msg.content, ""))
+        elseif msg isa PT.AIToolRequest
+            desc = join(("→ $(c.name)($(compact_args(c.args)))"
+                         for c in msg.tool_calls), "\n")
+            preface = something(msg.content, "")
+            "assistant", isempty(preface) ? desc : preface * "\n" * desc
+        else
+            "assistant", string(something(msg.content, ""))
+        end
         printstyled(io, "── ", role, " ", "─"^max(2, 46 - length(role)), "\n";
             color = :light_black)
-        println(io, rstrip(msg.content))
+        println(io, rstrip(body))
     end
     printstyled(io, "tokens: ", chat.tokens_in, " in / ", chat.tokens_out, " out\n";
         color = :light_black)

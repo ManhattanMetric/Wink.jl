@@ -44,18 +44,20 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     finally
         Wink.CONFIG.max_rounds = old_rounds
     end
-    users = [m for m in chat2.history if m isa PT.UserMessage]
-    ais = [m for m in chat2.history if m isa PT.AIMessage]
-    # tool results were flattened into plain user text...
-    @test any(m -> occursin("<tool_result name=\"get_doc\">", m.content), users)
+    # the history is native: the assistant's request and each result are
+    # first-class tool messages
+    @test any(m -> m isa PT.AIToolRequest && !isempty(m.tool_calls), chat2.history)
+    tool_results = [m for m in chat2.history if m isa PT.ToolMessage]
+    @test !isempty(tool_results)
+    @test all(m -> m.name == "get_doc", tool_results)
     # ...and the real get_doc tool actually ran
-    @test any(m -> occursin("friendly", m.content), users)
-    # the assistant turn records the flattened call description
-    @test any(m -> occursin("get_doc", m.content), ais)
+    @test any(m -> occursin("friendly", string(m.content)), tool_results)
     # round-cap wrap-up message was appended
-    @test any(m -> occursin("Tool budget exhausted", m.content), users)
-    # REGRESSION (renderer gap): the mock recorded the rendered payload; the
-    # flattened tool result must appear there as an ordinary rendered message
+    @test any(m -> m isa PT.UserMessage && occursin("Tool budget exhausted", m.content),
+        chat2.history)
+    # REGRESSION (renderer gap): for an Anthropic schema the RENDERED payload
+    # is the flattened projection — the tool result appears as ordinary text
+    # there even though the stored history is native
     @test occursin("tool_result", string(schema2.inputs))
 
     # --- gated tool: denial feeds DECLINED back into the conversation ---
@@ -73,7 +75,7 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
         Wink.CONFIG.confirm = old_confirm
         Wink.CONFIG.max_rounds = old_rounds
     end
-    @test any(m -> m isa PT.UserMessage && occursin("DECLINED", m.content),
+    @test any(m -> m isa PT.ToolMessage && occursin("DECLINED", string(m.content)),
         chat3.history)
 
     # --- gated tool: approval executes in the real Main ---
@@ -109,8 +111,10 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
         Wink.CONFIG.autoeval = old_auto
         Wink.CONFIG.max_rounds = old_rounds
     end
+    @test any(m -> m isa PT.ToolMessage &&
+                   occursin("hint: `system` does not exist", string(m.content)),
+        chat6.history)
     users6 = [m for m in chat6.history if m isa PT.UserMessage]
-    @test any(m -> occursin("hint: `system` does not exist", m.content), users6)
     @test count(m -> occursin("consecutive eval_code failures", m.content),
         users6) == 2
     @test any(m -> occursin("3 consecutive", m.content), users6)
@@ -121,6 +125,29 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     @test Wink.failed_eval_output("TOOL ERROR: boom")
     @test !Wink.failed_eval_output("value: 42")
     @test !Wink.failed_eval_output(Wink.DECLINED_MSG)
+
+    # --- native path: on an OpenAI-compatible schema the tool exchange renders
+    # natively (assistant tool_calls + role "tool"), with no flattened text ---
+    openai_response = Dict(
+        :choices => [Dict(:message => Dict(:content => nothing,
+                :tool_calls => [Dict(:id => "call_1", :type => "function",
+                    :function => Dict(:name => "get_doc",
+                        :arguments => "{\"name\": \"TestPkg.greet\"}"))]),
+            :finish_reason => "tool_calls")],
+        :usage => Dict(:prompt_tokens => 7, :completion_tokens => 3))
+    schema7 = PT.TestEchoOpenAISchema(; response = openai_response, status = 200)
+    chat7 = Wink.new_chat()
+    try
+        Wink.CONFIG.max_rounds = 2
+        Wink.run_turn!(chat7, "docs for greet?"; schema = schema7, io = devnull)
+    finally
+        Wink.CONFIG.max_rounds = old_rounds
+    end
+    @test any(m -> m isa PT.ToolMessage, chat7.history)
+    rendered = string(schema7.inputs)
+    @test occursin("tool_call_id", rendered)         # native tool-result message
+    @test occursin("tool_calls", rendered)           # native assistant request
+    @test !occursin("<tool_result", rendered)        # no flattened projection
 
     # --- thinking indicator: non-TTY path is a plain status line, result passes ---
     @test Wink.with_thinking(() -> 42, devnull) == 42

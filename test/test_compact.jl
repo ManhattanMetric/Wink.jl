@@ -1,47 +1,50 @@
+# Native-history helpers: a plausible session — system, a user turn, then
+# rounds of assistant + tool-result messages.
+wink_tm(name, body; id = "t1") =
+    PT.ToolMessage(; content = body, tool_call_id = id, raw = "{}", name)
+function wink_hist(n; tool = "eval_code", body = "ok")
+    h = PT.AbstractMessage[PT.SystemMessage("sys"), PT.UserMessage("build a blog")]
+    while length(h) < n
+        push!(h, PT.AIMessage("running a step"))
+        push!(h, wink_tm(tool, body))
+    end
+    return h
+end
+
 @testset "compact fold" begin
     long = repeat("x", 300)
-    block(name, body) = "<tool_result name=\"$name\">\n$body\n</tool_result>"
 
-    # a stale re-derivable result folds to an elision that keeps the tool name
-    out, n = Wink.fold_message(block("get_source", long))
-    @test n == 1
-    @test occursin("elided", out)
-    @test occursin("get_source", out)
-    @test !occursin(long, out)
+    # a stale re-derivable result folds in place, naming the tool to re-run
+    m = wink_tm("get_source", long)
+    @test Wink.fold_result!(m)
+    @test occursin("elided", m.content)
+    @test occursin("get_source", m.content)
+    # a second pass never re-folds (the elision is short)
+    @test !Wink.fold_result!(m)
 
     # mutating tools' results are historical facts — never folded
-    for name in ("eval_code", "run_shell", "edit_file")
-        out, n = Wink.fold_message(block(name, long))
-        @test n == 0
-        @test occursin(long, out)
+    for name in ("eval_code", "run_shell", "edit_file", "write_file")
+        m = wink_tm(name, long)
+        @test !Wink.fold_result!(m)
+        @test m.content == long
     end
 
     # short bodies are not worth an elision line
-    out, n = Wink.fold_message(block("get_doc", "tiny"))
-    @test n == 0
-    @test occursin("tiny", out)
-
-    # blocks inside one message fold independently
-    out, n = Wink.fold_message(block("get_doc", long) * "\n" * block("eval_code", long))
-    @test n == 1
-    @test occursin("elided", out)
-    @test occursin(long, out)
+    m = wink_tm("get_doc", "tiny")
+    @test !Wink.fold_result!(m)
+    @test m.content == "tiny"
 
     # history level: the most recent keep_recent result messages are protected
     hist = PT.AbstractMessage[
-        PT.SystemMessage("sys"),
-        PT.UserMessage("question"),
-        PT.AIMessage("→ get_doc(...)"),
-        PT.UserMessage(block("get_doc", long)),
-        PT.AIMessage("→ get_source(...)"),
-        PT.UserMessage(block("get_source", long)),
-        PT.AIMessage("→ list_methods(...)"),
-        PT.UserMessage(block("list_methods", long)),
+        PT.SystemMessage("sys"), PT.UserMessage("question"),
+        PT.AIMessage("x"), wink_tm("get_doc", long),
+        PT.AIMessage("x"), wink_tm("get_source", long),
+        PT.AIMessage("x"), wink_tm("list_methods", long),
     ]
     @test Wink.fold_history!(hist; keep_recent = 2) == 1
     @test occursin("elided", hist[4].content)
-    @test occursin(long, hist[6].content)
-    @test occursin(long, hist[8].content)
+    @test hist[6].content == long
+    @test hist[8].content == long
     # a second pass finds nothing new
     @test Wink.fold_history!(hist; keep_recent = 2) == 0
 
@@ -51,31 +54,29 @@
 end
 
 @testset "compact distill" begin
-    # a plausible flattened history: system, then turns of user/ai pairs
-    mkhist(n) = begin
-        h = PT.AbstractMessage[PT.SystemMessage("sys"), PT.UserMessage("build a blog")]
-        while length(h) < n
-            push!(h, PT.AIMessage("→ eval_code(...)"))
-            push!(h, PT.UserMessage("<tool_result name=\"eval_code\">\nok\n</tool_result>"))
-        end
-        h
-    end
-
-    # span selection: cut lands so the first kept message is an AIMessage
-    h = mkhist(14)
+    # span selection: the cut lands so the first kept message is assistant-side
+    # — never an orphaned tool result
+    h = wink_hist(14)
     r = Wink.distill_span(h; keep_recent = 6)
     @test r == 2:8
     @test h[first(r) - 1] isa PT.SystemMessage
     @test h[last(r) + 1] isa PT.AIMessage
 
     # too-small histories refuse to distill (this is also the cooldown)
-    @test Wink.distill_span(mkhist(8); keep_recent = 6) === nothing
+    @test Wink.distill_span(wink_hist(8); keep_recent = 6) === nothing
     @test Wink.distill_span(PT.AbstractMessage[PT.SystemMessage("sys")]) === nothing
 
-    # rendering labels roles
-    txt = Wink.render_span(h, 2:3)
+    # rendering labels roles, including native tool results and requests
+    txt = Wink.render_span(h, 2:4)
     @test occursin("[user]\nbuild a blog", txt)
     @test occursin("[assistant]", txt)
+    txt = Wink.render_span(h, 4:4)
+    @test occursin("[tool result: eval_code]\nok", txt)
+    req = PT.AIToolRequest(; content = "checking",
+        tool_calls = [wink_tm("get_doc", nothing)])
+    txt = Wink.render_span(PT.AbstractMessage[req], 1:1)
+    @test occursin("checking", txt)
+    @test occursin("→ get_doc(", txt)
 
     # a successful distillation splices the brief in place of the span
     brief_schema = PT.TestEchoAnthropicSchema(;
@@ -83,7 +84,7 @@ end
             "Goal: a blog. Done: nothing durable. Decisions: plain repo over " *
             "package. Open: scaffold layout."),
         status = 200)
-    chat = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    chat = Wink.Chat(wink_hist(14), Wink.build_tool_map(), 0, 0)
     @test Wink.distill_history!(chat; schema = brief_schema, io = devnull)
     @test length(chat.history) == 14 - 7 + 1
     @test chat.history[1] isa PT.SystemMessage
@@ -95,15 +96,15 @@ end
     # an empty brief leaves the history untouched
     empty_schema = PT.TestEchoAnthropicSchema(;
         response = anthropic_text_response(""), status = 200)
-    chat2 = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    chat2 = Wink.Chat(wink_hist(14), Wink.build_tool_map(), 0, 0)
     @test !Wink.distill_history!(chat2; schema = empty_schema, io = devnull)
     @test length(chat2.history) == 14
 
     # escalation policy: a productive fold defers distillation to a later round
     over = PT.AIMessage(; content = "x", tokens = (200_000, 1))
     long = repeat("x", 300)
-    h3 = mkhist(14)
-    h3[4] = PT.UserMessage("<tool_result name=\"get_doc\">\n$long\n</tool_result>")
+    h3 = wink_hist(14)
+    h3[4] = wink_tm("get_doc", long)
     chat3 = Wink.Chat(h3, Wink.build_tool_map(), 0, 0)
     old_budget = Wink.CONFIG.context_budget
     try
@@ -121,14 +122,6 @@ end
 end
 
 @testset "compact mine" begin
-    mkhist(n) = begin
-        h = PT.AbstractMessage[PT.SystemMessage("sys"), PT.UserMessage("build a blog")]
-        while length(h) < n
-            push!(h, PT.AIMessage("→ eval_code(...)"))
-            push!(h, PT.UserMessage("<tool_result name=\"eval_code\">\nok\n</tool_result>"))
-        end
-        h
-    end
     propose_response(name, def, why) = Dict{Symbol, Any}(
         :content => Dict{Symbol, Any}[Dict{Symbol, Any}(:type => "tool_use",
             :id => "toolu_9", :name => "propose_abstraction",
@@ -153,7 +146,7 @@ end
     old_confirm = Wink.CONFIG.confirm
     old_auto = Wink.CONFIG.autoeval
     seen = Ref{Any}(nothing)
-    chat = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    chat = Wink.Chat(wink_hist(14), Wink.build_tool_map(), 0, 0)
     try
         Wink.CONFIG.autoeval = false
         Wink.CONFIG.confirm = (k, t) -> (seen[] = (k, t); true)
@@ -207,7 +200,7 @@ end
         response = anthropic_text_response(
             "Goal: g. Done: d. Decisions: -. Open: -."),
         status = 200)
-    chat2 = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    chat2 = Wink.Chat(wink_hist(14), Wink.build_tool_map(), 0, 0)
     @test Wink.distill_history!(chat2; schema = brief_schema, io = devnull,
         promoted = ["wink_mined_double"])
     @test occursin("wink_mined_double", string(brief_schema.inputs))
@@ -222,7 +215,7 @@ end
             "\"\"\"\n    wink_mined_ladder()\n\nTest.\n\"\"\"\nwink_mined_ladder() = :ok",
             "recurred"),
         status = 200)
-    chat3 = Wink.Chat(mkhist(14), Wink.build_tool_map(), 0, 0)
+    chat3 = Wink.Chat(wink_hist(14), Wink.build_tool_map(), 0, 0)
     old_budget = Wink.CONFIG.context_budget
     try
         Wink.CONFIG.autoeval = true
@@ -260,8 +253,8 @@ end
     end
     results = [m for m in chat.history if Wink.is_tool_result_msg(m)]
     @test length(results) == 4
-    @test occursin("elided", results[1].content)      # stale → folded
-    @test !occursin("elided", results[end].content)   # recent → intact
+    @test occursin("elided", string(results[1].content))      # stale → folded
+    @test !occursin("elided", string(results[end].content))   # recent → intact
 
     # budget 0 disables the trigger entirely
     schema2 = PT.TestEchoAnthropicSchema(; response, status = 200)
@@ -274,6 +267,7 @@ end
         Wink.CONFIG.context_budget = old_budget
         Wink.CONFIG.max_rounds = old_rounds
     end
-    @test !any(m -> Wink.is_tool_result_msg(m) && occursin("elided", m.content),
+    @test !any(m -> Wink.is_tool_result_msg(m) &&
+                    occursin("elided", string(something(m.content, ""))),
         chat2.history)
 end
