@@ -3,13 +3,15 @@
 """
     default_confirm(kind::Symbol, text::AbstractString) -> Bool
 
-Show a proposed action (`kind` is `:eval`, `:edit`, or `:shell`) and ask the
-user for y/n approval on stdin. Returns `false` (deny) in non-interactive
-sessions, on Ctrl-C, and on anything but an explicit yes.
+Show a proposed action (`kind` is `:eval`, `:edit`, `:shell`, or `:abstract` —
+an abstraction proposed during context compaction) and ask the user for y/n
+approval on stdin. Returns `false` (deny) in non-interactive sessions, on
+Ctrl-C, and on anything but an explicit yes.
 """
 function default_confirm(kind::Symbol, text::AbstractString)
     header = kind === :edit ? "--- proposed edit ---" :
              kind === :shell ? "--- proposed shell command ---" :
+             kind === :abstract ? "--- proposed abstraction (from compaction) ---" :
              "--- proposed code ---"
     printstyled(stdout, "\n", header, "\n"; color = :yellow, bold = true)
     println(stdout, text)

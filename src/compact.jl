@@ -1,4 +1,5 @@
-# Context compaction, tiers 0 (fold) and 1 (distill).
+# Context compaction: tier 0 (fold), tier 1 (distill), tier 2 (abstraction
+# mining).
 #
 # Most of a long session's context is tool results that are pure functions of
 # the live session — source listings, method tables, docstrings. The session
@@ -10,8 +11,7 @@
 # which are historical facts. The trigger compares each round's
 # provider-reported prompt tokens against CONFIG.context_budget — a soft
 # target, deliberately far below any model's hard window: pressure against it
-# is treated as a signal, not an emergency. Tier 2 (gated abstraction
-# mining) is planned on top of these two passes.
+# is treated as a signal, not an emergency.
 
 # Allowlist, not a blocklist: a tool must be known-pure to be foldable, so new
 # tools default to being kept.
@@ -153,17 +153,24 @@ end
 
 Tier-1 compaction: replace the oldest span of the conversation with a model-
 written brief of its non-re-derivable content (goal, work done, decisions and
-rejected approaches, open threads). On any failure — the call erroring, or an
-empty brief — the history is left untouched. Returns whether a distillation
-happened.
+rejected approaches, open threads). `promoted` names definitions just mined
+from this span (see [`mine_abstractions!`](@ref)) so the brief can reference
+them. On any failure — the call erroring, or an empty brief — the history is
+left untouched. Returns whether a distillation happened.
 """
 function distill_history!(chat::Chat; schema = nothing, io::IO = CONFIG.status_io,
-        keep_recent::Integer = DISTILL_KEEP_RECENT)
+        keep_recent::Integer = DISTILL_KEEP_RECENT,
+        promoted::Vector{String} = String[])
     r = distill_span(chat.history; keep_recent)
     r === nothing && return false
     # The span fits the model's hard window even though it broke the soft
     # budget: budget << window by design, and folding already ran.
     span_text = render_span(chat.history, r)
+    isempty(promoted) ||
+        (span_text *= "\n\n[compaction note] These definitions were just " *
+                      "promoted out of this span's recurring patterns and are " *
+                      "live in the session — record them under Done by name: " *
+                      join(promoted, ", "))
     brief = try
         msgs = PT.AbstractMessage[PT.SystemMessage(DISTILL_PROMPT),
             PT.UserMessage(span_text)]
@@ -182,12 +189,115 @@ function distill_history!(chat::Chat; schema = nothing, io::IO = CONFIG.status_i
     return true
 end
 
+# ---- tier 2: abstraction mining ----------------------------------------------
+#
+# The thesis payoff. Token pressure on a span is treated as Rule-of-Three
+# evidence: if the transcript kept re-spelling a pattern, that recurrence is
+# the license Wink's own ethos demands before naming an abstraction — the
+# mining pass may only propose what the span has already earned, never
+# speculate to save tokens. It runs on the same doomed span as distillation,
+# and must run FIRST: after the distill the code lumps (the evidence) are
+# gone. Every proposal goes through the confirmation gate individually, so
+# compaction becomes an interactive refactoring moment; accepted definitions
+# land in the live session, and the distill pass is told their names so the
+# brief can reference them.
+
+const MINE_PROMPT = """
+You are reviewing a span of an AI pair-programming transcript, from a live
+Julia session, that is about to be compacted away. Your job is abstraction
+mining: find code patterns the session kept re-spelling that deserve to
+become named definitions.
+
+Rules:
+- Propose only what the transcript has EARNED: a pattern must appear at
+  least twice, or be one code lump too large to hold in the head, before it
+  deserves a name. Never invent speculative abstractions.
+- Choose the weakest form that works: a function before a type, a type
+  before a macro.
+- If a definition already visible in the span captures the pattern, do not
+  re-propose it.
+- Each proposal must be complete, runnable Julia beginning with a docstring
+  that states what it is for — the docstring is how it will be found later.
+- Name things in the user's domain language, not the mechanism's.
+
+Make one propose_abstraction call per proposal. If nothing has been earned,
+make no calls and reply with the single word: none.
+"""
+
+"""
+    propose_abstraction(name::String, definition::String, rationale::String) -> String
+
+Propose promoting a recurring pattern from the transcript span into a named,
+documented Julia definition. `definition` must be complete, valid Julia
+source, beginning with a docstring, that defines `name`; `rationale` is one
+sentence naming the recurrence that earned it.
+"""
+tool_propose_abstraction(name::String, definition::String, rationale::String) =
+    "recorded"
+
+propose_tool() = collect(values(PT.tool_call_signature(tool_propose_abstraction;
+    name = "propose_abstraction", max_description_length = 4000)))
+
+"""
+    mine_abstractions!(chat::Chat; schema = nothing, io = CONFIG.status_io,
+                       keep_recent = DISTILL_KEEP_RECENT) -> Vector{String}
+
+Tier-2 compaction: ask the model to mine the doomed span for recurring code
+patterns worth promoting into named definitions. Each proposal is shown
+through the confirmation gate (kind `:abstract`, rationale included) and, if
+accepted, evaluated in the live `Main`; definitions that fail to evaluate are
+skipped, and names already defined are never re-proposed. Returns the names
+installed.
+"""
+function mine_abstractions!(chat::Chat; schema = nothing, io::IO = CONFIG.status_io,
+        keep_recent::Integer = DISTILL_KEEP_RECENT)
+    r = distill_span(chat.history; keep_recent)
+    r === nothing && return String[]
+    msg = try
+        m = _aitools_call(schema,
+            PT.AbstractMessage[PT.SystemMessage(MINE_PROMPT),
+                PT.UserMessage(render_span(chat.history, r))],
+            propose_tool())
+        _tally!(chat, m)
+        m
+    catch e
+        e isa InterruptException && rethrow()
+        debug_status(io, "abstraction mining call failed: $(sprint(showerror, e))")
+        return String[]
+    end
+    installed = String[]
+    for c in msg.tool_calls
+        name = strip(string(get(c.args, :name, "")))
+        code = string(get(c.args, :definition, ""))
+        why = strip(string(get(c.args, :rationale, "")))
+        (isempty(name) || isempty(strip(code))) && continue
+        if isdefined(Main, Symbol(name))
+            debug_status(io, "mined `$name` is already defined; skipped")
+            continue
+        end
+        shown = (isempty(why) ? "" : "# why: $why\n") * code
+        if !(CONFIG.autoeval || CONFIG.confirm(:abstract, shown))
+            status(io, "declined abstraction proposal `$name`")
+            continue
+        end
+        res = eval_in_main(code)
+        if res.ok
+            push!(installed, String(name))
+            status(io, "promoted recurring pattern into `$name`")
+        else
+            debug_status(io, "mined definition `$name` failed to evaluate; skipped")
+        end
+    end
+    return installed
+end
+
 # ---- trigger -----------------------------------------------------------------
 
 # Called once per agent round with that round's reply, whose token counts are
 # the provider's own report of the prompt we just sent. Escalation ladder:
 # fold first; only when a fold yields nothing (so its savings, if any, have
-# already been reflected in a later token report) does distillation run.
+# already been reflected in a later token report) do mining and distillation
+# run — mining first, on the same span, while the evidence still exists.
 function maybe_compact!(chat, msg, io::IO; schema = nothing)
     budget = CONFIG.context_budget
     budget > 0 || return nothing
@@ -203,9 +313,9 @@ function maybe_compact!(chat, msg, io::IO; schema = nothing)
                    "folded $folded stale tool results")
         return nothing
     end
-    distill_history!(chat; schema, io) ||
+    promoted = mine_abstractions!(chat; schema, io)
+    distill_history!(chat; schema, io, promoted) ||
         debug_status(io, "context at $prompt_tokens tokens exceeds budget " *
-                         "$budget; nothing to fold and span too small to " *
-                         "distill (tier 2 not yet implemented)")
+                         "$budget; nothing to fold and span too small to distill")
     return nothing
 end
