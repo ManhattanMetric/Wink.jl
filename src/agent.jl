@@ -276,17 +276,32 @@ function _aitools_call(schema, history, tools)
            PT.aitools(schema, history; kwargs...)
 end
 
-# A no-tool-call reply whose final line mimics the transcript's "→ tool(...)"
-# gloss is an unexecuted intent, not an answer: small models imitate the
-# flattened history instead of using the tool-calling API. Returns the tool
-# name, or nothing when the text ends like a real answer.
+# A no-tool-call reply that ends by imitating the transcript's "→ tool(...)"
+# gloss — on one line or spilling a code payload across many — is an
+# unexecuted intent, not an answer: small models imitate the flattened history
+# instead of using the tool-calling API. Detection: take the last line that
+# opens like a call to a registered tool and walk its parentheses to the end
+# of the message. Ending inside the call, or exactly at its close, is an
+# intent; trailing prose after the close is a mention of a past call. Returns
+# the tool name, or nothing when the text ends like a real answer.
 function textual_tool_call(text::AbstractString, tool_names)
-    lines = filter(!isempty, [strip(l) for l in split(text, '\n')])
-    isempty(lines) && return nothing
-    m = match(r"^(?:→|->)?\s*([A-Za-z_][A-Za-z0-9_!]*)\s*\(.*\)$", String(last(lines)))
-    m === nothing && return nothing
-    name = String(m.captures[1])
-    return name in tool_names ? name : nothing
+    s = rstrip(text)
+    isempty(s) && return nothing
+    opener = nothing
+    for m in eachmatch(r"^\s*(?:→|->)?\s*([A-Za-z_][A-Za-z0-9_!]*)\s*\("m, s)
+        String(m.captures[1]) in tool_names && (opener = m)
+    end
+    opener === nothing && return nothing
+    name = String(opener.captures[1])
+    rest = SubString(s, findnext('(', s, opener.offset))
+    depth = 0
+    for (j, c) in pairs(rest)
+        c == '(' && (depth += 1)
+        c == ')' && (depth -= 1)
+        depth == 0 &&
+            return isempty(strip(SubString(rest, nextind(rest, j)))) ? name : nothing
+    end
+    return name   # parens never closed: the message ends mid-call
 end
 
 # The recovery reflex, part 2 (part 1 is `api_hint`): spot blind retry streaks.
@@ -334,10 +349,12 @@ function run_turn!(chat::Chat, user_text::AbstractString;
                     push!(chat.history,
                         PT.UserMessage("(system note: your message ended with " *
                                        "\"$(name)(...)\" written as text, which runs " *
-                                       "nothing — the \"→ tool(...)\" lines in this " *
+                                       "nothing — NO tool call written as text in that " *
+                                       "message ran. The \"→ tool(...)\" lines in this " *
                                        "transcript are records of calls already made. " *
                                        "Invoke $(name) through the tool-calling " *
-                                       "interface to actually run it.)"))
+                                       "interface, one call at a time, to actually " *
+                                       "run it.)"))
                     debug_status(io,
                         "model wrote a tool call as text; asking for a real $(name) call")
                     continue

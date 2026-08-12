@@ -137,6 +137,29 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     @test Wink.textual_tool_call("The answer is 42.", tools) === nothing
     @test Wink.textual_tool_call("", tools) === nothing
 
+    # multi-line imitation: a code payload spilling across lines (the shape a
+    # live session produced — prose, then a fake call running to message end)
+    multiline = """
+    I'll start by writing the Models.jl file.
+
+    → eval_code(code="open(\\"src/Models.jl\\", \\"w\\") do io
+        write(io, \\"\\"\\"
+        module Models
+        end
+        \\"\\"\\")
+    end")"""
+    @test Wink.textual_tool_call(multiline, tools) == "eval_code"
+    # ...including when the parens never close before the message ends
+    @test Wink.textual_tool_call("→ eval_code(code=\"f(x\n= 1\n", tools) ==
+          "eval_code"
+    # several fake calls with prose between: the last one is the intent
+    interleaved = "→ get_doc(name=\"sort\")\nActually, wrong tool.\n" *
+                  "→ get_source(signature=\"sort(::Vector{Int})\n    more args\")"
+    @test Wink.textual_tool_call(interleaved, tools) == "get_source"
+    # a closed call followed by prose is still a mention, even multi-line
+    @test Wink.textual_tool_call("→ eval_code(code=\"1+1\")\nwhich returned 2.",
+        tools) === nothing
+
     # A reply ending in a textual call is nudged instead of accepted as final:
     # the echo replays the same text every round, so the loop nudges once per
     # round and then falls through to the forced-final path.
