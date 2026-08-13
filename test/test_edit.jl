@@ -112,6 +112,29 @@ end
 
     # registered as a model-facing tool
     @test Wink.has_tool("write_file")
+
+    # the session's working directory is inside the perimeter even when the
+    # active project points elsewhere (the default environment, say) — the
+    # exact situation that pushed a live model into cat-heredoc workarounds
+    old_confirm = Wink.CONFIG.confirm
+    mktempdir() do dir
+        cd(dir) do
+            try
+                Wink.CONFIG.confirm = (k, t) -> true
+                out = Wink.tool_write_file("src/models.jl", "module Models\nend\n")
+                @test startswith(out, "OK")
+                @test isfile(joinpath(dir, "src", "models.jl"))
+                out = Wink.tool_edit_file(joinpath(dir, "src", "models.jl"),
+                    "module Models", "module BlogModels")
+                @test startswith(out, "OK") || startswith(out, "EDITED")
+                # readable too: the model can read back what it wrote
+                @test occursin("BlogModels",
+                    Wink.tool_read_file(joinpath(dir, "src", "models.jl"), "", ""))
+            finally
+                Wink.CONFIG.confirm = old_confirm
+            end
+        end
+    end
 end
 
 # End-to-end: edit a Revise-tracked file and observe the redefinition live.

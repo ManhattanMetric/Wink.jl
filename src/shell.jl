@@ -45,11 +45,15 @@ when nonzero). This is the right tool for anything you would type in a
 terminal — git, mkdir/ls/cp, curl, build tools, package managers — use it
 instead of translating shell work into Julia code for eval_code. `command` is
 one plain string passed to `sh -c`, so pipes, `&&`, redirection, quoting, and
-globs all work. Each call runs in a fresh shell process: `cd` and environment
-changes do not persist to the next call — to run somewhere specific, pass that
-directory as `dir` (`""` runs in the session's current directory). Unless
-auto-approval is on, the user is shown the command first and may decline; a
-DECLINED result means do not retry it verbatim.
+globs all work. Two things do NOT belong here: Julia Pkg operations (run them
+in eval_code so they affect the live session — a subprocess's Pkg.add installs
+what this session cannot load) and writing files via heredoc or redirection
+(use write_file/edit_file so changes pass their gates). Each call runs in a
+fresh shell process: `cd` and environment changes do not persist to the next
+call — to run somewhere specific, pass that directory as `dir` (`""` runs in
+the session's current directory). Unless auto-approval is on, the user is
+shown the command first and may decline; a DECLINED result means do not retry
+it verbatim.
 """
 tool_run_shell(command::String, dir::String) = tool_guard("run_shell") do
     isempty(strip(command)) && throw(WinkResolveError("command is empty"))

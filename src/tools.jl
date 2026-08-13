@@ -283,6 +283,9 @@ function read_roots()
     roots = String[]
     proj = Base.active_project()
     proj === nothing || push!(roots, dirname(realpath_or(proj)))
+    # The session's working directory is the user's workspace even when the
+    # active project points elsewhere (e.g. the default environment).
+    push!(roots, realpath_or(pwd()))
     for mod in values(Base.loaded_modules)
         d = pkgdir(mod)
         d === nothing || push!(roots, realpath_or(d))
@@ -308,7 +311,8 @@ function readable_path(path::AbstractString)
     isfile(p) || throw(WinkResolveError("not a file: $p"))
     any(Base.Fix1(under, p), read_roots()) ||
         throw(WinkResolveError("`$p` is outside the readable perimeter (the active " *
-                               "project, loaded packages, and Julia's source tree)"))
+                               "project, the session's working directory, loaded " *
+                               "packages, and Julia's source tree)"))
     any(endswith(p, ext) for ext in TEXT_FILE_EXTS) ||
         throw(WinkResolveError("only these file types can be read: " *
                                join(TEXT_FILE_EXTS, ", ")))

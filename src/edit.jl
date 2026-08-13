@@ -8,12 +8,15 @@
 # Extra allowed roots, used by the test suite.
 const EXTRA_EDIT_ROOTS = String[]
 
-# Editable: the active project and packages loaded for development. Explicitly
-# NOT editable: stdlib and the content-addressed package depot copies.
+# Editable: the active project, the session's working directory (the user's
+# workspace even when the active project is the default environment), and
+# packages loaded for development. Explicitly NOT editable: stdlib and the
+# content-addressed package depot copies.
 function edit_roots()
     roots = String[]
     proj = Base.active_project()
     proj === nothing || push!(roots, dirname(realpath_or(proj)))
+    push!(roots, realpath_or(pwd()))
     stddir = realpath_or(joinpath(Sys.BINDIR, "..", "share", "julia"))
     depot_pkgs = [realpath_or(joinpath(d, "packages")) for d in DEPOT_PATH]
     for m in values(Base.loaded_modules)
@@ -39,8 +42,10 @@ function editable_path(path::AbstractString)
     endswith(p, ".jl") || throw(WinkResolveError("only .jl files can be edited"))
     any(Base.Fix1(under, p), edit_roots()) ||
         throw(WinkResolveError("`$p` is outside the editable perimeter (the active " *
-                               "project and packages under development). Stdlib and " *
-                               "installed depot packages are read-only."))
+                               "project, the session's working directory, and " *
+                               "packages under development). Stdlib and installed " *
+                               "depot packages are read-only. If this is the " *
+                               "user's project, cd there or Pkg.activate it first."))
     return p
 end
 
@@ -158,7 +163,9 @@ function writable_new_path(path::AbstractString)
     resolved = joinpath(realpath_or(anc), rest)
     any(Base.Fix1(under, resolved), edit_roots()) ||
         throw(WinkResolveError("`$p` is outside the editable perimeter (the " *
-                               "active project and packages under development)"))
+                               "active project, the session's working directory, " *
+                               "and packages under development). If this is the " *
+                               "user's project, cd there or Pkg.activate it first."))
     return resolved
 end
 
