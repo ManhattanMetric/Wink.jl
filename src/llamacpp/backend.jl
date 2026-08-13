@@ -234,8 +234,27 @@ _tool_schema(t) = Dict{String, Any}("function" => Dict{String, Any}(
 
 # ---- the seam implementation --------------------------------------------------
 
+# Tokens the model must never emit in Wink's flow. `<|tool_response>` is an
+# EOG token (llama.cpp stops generation so a harness can supply results), but
+# Wink always injects tool responses itself — when the model reflexively
+# opens the next call→response cycle with it, generation dies with an empty
+# reply. Ban it at the logits.
+function _banned_tokens(vocab)
+    banned = L.llama_logit_bias[]
+    for marker in ("<|tool_response>",)
+        toks = _lc_tokenize(vocab, marker; add_special = false)
+        length(toks) == 1 &&
+            push!(banned, L.llama_logit_bias(toks[1], -Inf32))
+    end
+    return banned
+end
+
 function _local_chain(vocab; grammar = nothing)
     chain = L.llama_sampler_chain_init(L.llama_sampler_chain_default_params())
+    banned = _banned_tokens(vocab)
+    isempty(banned) || GC.@preserve banned L.llama_sampler_chain_add(chain,
+        L.llama_sampler_init_logit_bias(L.llama_vocab_n_tokens(vocab),
+            length(banned), pointer(banned)))
     if grammar !== nothing
         trigger = "<|tool_call>"
         triggers = [trigger]
@@ -286,32 +305,49 @@ function _local_aitools(lm::LocalModel, history, tools)
                 _lc_tokenize(lm.vocab, suffix; add_special = false)
         scratch += _lc_decode!(lm.ctx, stoks)
 
-        chain = _local_chain(lm.vocab;
-            grammar = isempty(schemas) ? nothing : tool_call_grammar(schemas))
-        out = IOBuffer()
-        next = Int32[0]
-        tail = ""
-        call_opened = false
-        try
-            while n_gen < CONFIG.max_tokens
-                tok = L.llama_sampler_sample(chain, lm.ctx, Int32(-1))
-                L.llama_vocab_is_eog(lm.vocab, tok) && break
-                s = _lc_piece(lm.vocab, tok)
-                print(out, s)
-                tail = last(tail * s, 24)
-                occursin("<|tool_call>", tail) && (call_opened = true)
-                n_gen += 1
-                next[1] = tok
-                scratch += _lc_decode!(lm.ctx, next)
-                # a call is complete only when one was actually OPENED — the
-                # model can emit a stray close token with the grammar dormant,
-                # and breaking on it would swallow the rest of the reply
-                call_opened && endswith(tail, "<tool_call|>") && break
+        gen_grammar = isempty(schemas) ? nothing : tool_call_grammar(schemas)
+        suffix_base = scratch
+        function generate_once!()
+            chain = _local_chain(lm.vocab; grammar = gen_grammar)
+            out = IOBuffer()
+            next = Int32[0]
+            tail = ""
+            call_opened = false
+            g = 0
+            try
+                while g < CONFIG.max_tokens
+                    tok = L.llama_sampler_sample(chain, lm.ctx, Int32(-1))
+                    L.llama_vocab_is_eog(lm.vocab, tok) && break
+                    s = _lc_piece(lm.vocab, tok)
+                    print(out, s)
+                    tail = last(tail * s, 24)
+                    occursin("<|tool_call>", tail) && (call_opened = true)
+                    g += 1
+                    next[1] = tok
+                    scratch += _lc_decode!(lm.ctx, next)
+                    # a call is complete only when one was actually OPENED —
+                    # the model can emit a stray close token with the grammar
+                    # dormant, and breaking on it would swallow the reply
+                    call_opened && endswith(tail, "<tool_call|>") && break
+                end
+            finally
+                L.llama_sampler_free(chain)
             end
-        finally
-            L.llama_sampler_free(chain)
+            return String(take!(out)), g
         end
-        text = String(take!(out))
+        text, n_gen = generate_once!()
+        if parse_tool_call(text) === nothing &&
+           isempty(strip(g4_strip_thinking(text)))
+            # an empty round (immediate EOG, or pure channel noise): rewind
+            # whatever the dud generation decoded and redraw once with a
+            # fresh sampler seed rather than ending the turn with silence
+            if scratch > suffix_base
+                L.llama_memory_seq_rm(mem, 0,
+                    L.llama_pos(lm.kv_tokens + suffix_base), L.llama_pos(-1))
+                scratch = suffix_base
+            end
+            text, n_gen = generate_once!()
+        end
     catch
         # a failed decode leaves the cache in an unknown state: start clean
         L.llama_memory_clear(mem, true)
