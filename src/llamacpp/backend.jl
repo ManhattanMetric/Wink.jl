@@ -74,6 +74,11 @@ function _lc_decode!(ctx, toks::Vector{Int32}; n_batch::Integer = 512)
         ret == 0 || error("llama_decode failed with $ret (context full? " *
                           "lower context_budget or raise n_ctx in local_model!)")
         i += length(chunk)
+        # blocking ccalls starve Julia's cooperative scheduler: without this,
+        # with_thinking's spinner task never gets a frame. Every prompt chunk
+        # and every generated token passes through here, so this one yield
+        # keeps the UI alive at both cadences.
+        yield()
     end
     return length(toks)
 end
