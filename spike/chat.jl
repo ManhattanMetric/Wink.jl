@@ -18,6 +18,7 @@
 # Run: julia --project=spike spike/chat.jl [path-to-gguf]
 
 include(joinpath(@__DIR__, "common.jl"))
+include(joinpath(@__DIR__, "render.jl"))
 
 const MODEL = get(ARGS, 1, expanduser(
     "~/.lmstudio/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF/" *
@@ -35,41 +36,26 @@ println("ok")
 tmpl_ptr = L.llama_model_chat_template(model, C_NULL)
 const TEMPLATE = tmpl_ptr == C_NULL ? nothing : unsafe_string(tmpl_ptr)
 
-chatml(msgs; add_assistant) =
-    join("<|im_start|>$(m.role)\n$(m.content)<|im_end|>\n" for m in msgs) *
-    (add_assistant ? "<|im_start|>assistant\n" : "")
-
-# Render via llama.cpp's matcher; returns nothing when the family is unknown.
-function render_native(msgs; add_assistant::Bool)
-    TEMPLATE === nothing && return nothing
-    roles = String[m.role for m in msgs]
-    contents = String[m.content for m in msgs]
-    cmsgs = [L.llama_chat_message(Ptr{Cchar}(pointer(roles[i])),
-                 Ptr{Cchar}(pointer(contents[i]))) for i in eachindex(msgs)]
-    buf = Vector{UInt8}(undef, 16384)
-    GC.@preserve roles contents begin
-        n = L.llama_chat_apply_template(TEMPLATE, cmsgs, length(cmsgs),
-            add_assistant, buf, length(buf))
-        n < 0 && return nothing
-        if n > length(buf)
-            resize!(buf, n)
-            n = L.llama_chat_apply_template(TEMPLATE, cmsgs, length(cmsgs),
-                add_assistant, buf, length(buf))
-            n < 0 && return nothing
-        end
-        return String(buf[1:n])
+# Probe: can llama.cpp's C matcher render this template at all?
+function native_probe()
+    TEMPLATE === nothing && return false
+    role, content = "user", "probe"
+    buf = Vector{UInt8}(undef, 512)
+    GC.@preserve role content begin
+        cmsg = [L.llama_chat_message(Ptr{Cchar}(pointer(role)),
+            Ptr{Cchar}(pointer(content)))]
+        return L.llama_chat_apply_template(TEMPLATE, cmsg, 1, true,
+            buf, length(buf)) >= 0
     end
 end
 
-const NATIVE_OK = render_native([(role = "user", content = "probe")];
-    add_assistant = true) !== nothing
+const FAMILY = template_family(TEMPLATE; native_probe)
 println("template: ", TEMPLATE === nothing ? "(none in metadata)" :
-        "$(length(TEMPLATE)) chars in metadata", " — ",
-    NATIVE_OK ? "rendered by llama.cpp's matcher" :
-    "family NOT recognized by the C matcher; falling back to ChatML")
+        "$(length(TEMPLATE)) chars in metadata", " — family: ",
+    nameof(typeof(FAMILY)),
+    FAMILY isa ChatMLTemplate ? " (LAST-RESORT FALLBACK — output will be degraded)" : "")
 
-render(msgs; add_assistant) = NATIVE_OK ?
-    render_native(msgs; add_assistant) : chatml(msgs; add_assistant)
+render(msgs; add_assistant) = render_chat(FAMILY, msgs; add_assistant)
 
 # ---- sampler chain ------------------------------------------------------------
 
