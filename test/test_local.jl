@@ -20,6 +20,13 @@
     @test m["role"] == "assistant"
     @test m["tool_calls"][1]["function"]["name"] == "get_doc"
     @test m["tool_calls"][1]["function"]["arguments"] == Dict("name" => "sort")
+    # call-bearing turns: preface rides the reasoning field (rendered as the
+    # thought channel), never content (which would close the turn dead)
+    @test m["content"] == ""
+    @test m["reasoning"] == "checking"
+    plain = Wink._local_msg(PT.AIToolRequest(; content = "just text"))
+    @test plain["content"] == "just text"
+    @test plain["reasoning"] == ""
 
     m = Wink._local_msg(PT.ToolMessage(; content = "the docstring",
         tool_call_id = "local-1", raw = "{}", name = "get_doc"))
@@ -45,6 +52,8 @@
     r = Wink.render_chat(Wink.Gemma4Template(), msgs;
         tools = schemas, add_assistant = true)
     @test occursin("<|tool_call>call:get_doc{name:<|\"|>sort<|\"|>}<tool_call|>", r)
+    # the preface renders as the thought channel before the call
+    @test occursin("<|channel>thought\nchecking\n<channel|><|tool_call>", r)
     @test occursin("<|tool_response>response:get_doc{value:<|\"|>sorts things<|\"|>}", r)
     c = Wink.parse_tool_call(r)
     @test c.name == "get_doc" && c.args == Dict("name" => "sort")

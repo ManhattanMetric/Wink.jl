@@ -78,6 +78,35 @@ function _lc_decode!(ctx, toks::Vector{Int32}; n_batch::Integer = 512)
     return length(toks)
 end
 
+# ---- logging ------------------------------------------------------------------
+#
+# llama.cpp logs straight to stderr by default — model-load inventories, Metal
+# kernel compiles, and per-token grammar traces that are pure trace-level
+# noise. We install a filtering callback: warnings and errors always show
+# (out-of-memory matters), info shows under CONFIG.debug, and the per-token
+# DEBUG firehose only with ENV["WINK_LLAMA_TRACE"]. CONT lines inherit the
+# level of the message they continue.
+
+const LLAMA_LOG_THRESHOLD = Ref{UInt32}(UInt32(L.GGML_LOG_LEVEL_WARN))
+const LLAMA_LOG_LAST = Ref{UInt32}(0)
+
+function _llama_log_cb(level::UInt32, text::Ptr{Cchar}, ::Ptr{Cvoid})::Cvoid
+    lvl = level == UInt32(L.GGML_LOG_LEVEL_CONT) ? LLAMA_LOG_LAST[] : level
+    LLAMA_LOG_LAST[] = lvl
+    lvl >= LLAMA_LOG_THRESHOLD[] && print(stderr, unsafe_string(Ptr{UInt8}(text)))
+    return nothing
+end
+
+function _install_log_filter!()
+    LLAMA_LOG_THRESHOLD[] = haskey(ENV, "WINK_LLAMA_TRACE") ?
+                            UInt32(L.GGML_LOG_LEVEL_DEBUG) :
+                            CONFIG.debug ? UInt32(L.GGML_LOG_LEVEL_INFO) :
+                            UInt32(L.GGML_LOG_LEVEL_WARN)
+    cb = @cfunction(_llama_log_cb, Cvoid, (UInt32, Ptr{Cchar}, Ptr{Cvoid}))
+    L.llama_log_set(cb, C_NULL)
+    return nothing
+end
+
 # ---- lifecycle ----------------------------------------------------------------
 
 _default_libllama() = normpath(joinpath(@__DIR__, "..", "..", "spike", "vendor",
@@ -108,6 +137,7 @@ function local_model!(path::AbstractString; n_ctx::Integer = 16_384,
     p = expanduser(path)
     isfile(p) || error("model not found: $p")
 
+    _install_log_filter!()
     L.llama_backend_init()
     mp = Ref(L.llama_model_default_params())
     _poke!(mp, :n_gpu_layers, Int32(n_gpu_layers))
@@ -172,11 +202,14 @@ _local_msg(m::PT.AIMessage) =
 # A call-bearing turn must render with empty content: under the canonical
 # template, content alongside tool calls CLOSES the model turn, and after the
 # responses no generation prompt follows — the model would have nowhere to
-# continue. With empty content the turn stays open across the tool cycle.
-# The preface text is still stored on the AIToolRequest for transcripts.
+# continue. The preface text instead rides the `reasoning` field, which the
+# renderer emits as the thought channel before the calls — the canonical home
+# for pre-call narration, and the template's own reasoning guard drops it
+# automatically once the conversation moves past the next user turn.
 _local_msg(m::PT.AIToolRequest) =
     Dict{String, Any}("role" => "assistant",
         "content" => isempty(m.tool_calls) ? something(m.content, "") : "",
+        "reasoning" => isempty(m.tool_calls) ? "" : something(m.content, ""),
         "tool_calls" => [Dict{String, Any}(
             "id" => c.tool_call_id,
             "function" => Dict{String, Any}(
@@ -253,17 +286,22 @@ function _local_aitools(lm::LocalModel, history, tools)
         out = IOBuffer()
         next = Int32[0]
         tail = ""
+        call_opened = false
         try
             while n_gen < CONFIG.max_tokens
                 tok = L.llama_sampler_sample(chain, lm.ctx, Int32(-1))
                 L.llama_vocab_is_eog(lm.vocab, tok) && break
                 s = _lc_piece(lm.vocab, tok)
                 print(out, s)
-                tail = last(tail * s, 16)
+                tail = last(tail * s, 24)
+                occursin("<|tool_call>", tail) && (call_opened = true)
                 n_gen += 1
                 next[1] = tok
                 scratch += _lc_decode!(lm.ctx, next)
-                endswith(tail, "<tool_call|>") && break   # call complete
+                # a call is complete only when one was actually OPENED — the
+                # model can emit a stray close token with the grammar dormant,
+                # and breaking on it would swallow the rest of the reply
+                call_opened && endswith(tail, "<tool_call|>") && break
             end
         finally
             L.llama_sampler_free(chain)
@@ -286,9 +324,12 @@ function _local_aitools(lm::LocalModel, history, tools)
     call = parse_tool_call(text)
     # The model may open/close thought channels (it does after tool
     # responses); strip them like the renderer strips them from history, so
-    # stored content matches its re-rendered form.
+    # stored content matches its re-rendered form — and drop any stray tool
+    # markers a dormant-grammar wobble left behind.
     call === nothing &&
-        return PT.AIToolRequest(; content = String(g4_strip_thinking(text)),
+        return PT.AIToolRequest(;
+            content = String(strip(replace(g4_strip_thinking(text),
+                "<tool_call|>" => "", "<|tool_response>" => ""))),
             tool_calls = PT.ToolMessage[], tokens = (total, n_gen),
             elapsed = time() - t0)
     idx = findfirst("<|tool_call>", text)

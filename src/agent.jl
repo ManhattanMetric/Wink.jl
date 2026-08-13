@@ -404,6 +404,10 @@ function run_turn!(chat::Chat, user_text::AbstractString;
                 return text
             end
             push!(chat.history, msg)   # the AIToolRequest itself, calls included
+            # narration accompanying tool calls is part of the answer the user
+            # is waiting on — show it now, not never
+            preface = something(msg.content, "")
+            isempty(strip(preface)) || print_answer(preface)
             for c in calls
                 t0 = time()
                 out = execute_tool_call(chat.tool_map, c)
