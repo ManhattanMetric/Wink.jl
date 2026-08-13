@@ -64,6 +64,16 @@ function _lc_piece(vocab, tok::Integer)
     return String(buf[1:max(len, 0)])
 end
 
+# Refuse to slam into the context wall at the C level: a friendly error the
+# user can act on beats "failed to find a memory slot".
+function _room_check(lm, needed::Integer)
+    needed <= lm.n_ctx - 32 && return nothing
+    error("context window full ($needed tokens needed, n_ctx = $(lm.n_ctx)): " *
+          "run :compact or Wink.reset!(), or reload with a larger context " *
+          "via local_model!(path; n_ctx = ...). If this recurs, check that " *
+          "CONFIG.context_budget sits well below n_ctx so compaction fires first.")
+end
+
 # Decode in n_batch-sized chunks (llama_decode rejects oversized batches).
 function _lc_decode!(ctx, toks::Vector{Int32}; n_batch::Integer = 512)
     i = 1
@@ -117,8 +127,23 @@ end
 _default_libllama() = normpath(joinpath(@__DIR__, "..", "..", "spike", "vendor",
     "llama-b10405", "libllama.dylib"))
 
+# The global context_budget default assumes frontier-sized windows; a local
+# model's real ceiling is n_ctx. Lower the budget (never raise it — explicit
+# user settings win) so the fold/distill/mine ladder fires well before
+# llama_decode hits the wall.
+function _coordinate_budget!(n_ctx::Integer)
+    auto = (3 * Int(n_ctx)) ÷ 4
+    if CONFIG.context_budget == 0
+        @warn "auto-compaction is disabled (context_budget = 0); the local " *
+              "model's $(n_ctx)-token context can overflow mid-conversation"
+    elseif CONFIG.context_budget > auto
+        CONFIG.context_budget = auto
+    end
+    return CONFIG.context_budget
+end
+
 """
-    local_model!(path::AbstractString; n_ctx = 16_384, n_gpu_layers = 99)
+    local_model!(path::AbstractString; n_ctx = 32_768, n_gpu_layers = 99)
 
 Load a GGUF model INTO this Julia process (llama.cpp via LibLlama) and route
 all of Wink's chat through it — no server, no HTTP. The model's chat template
@@ -127,10 +152,15 @@ family; tool calls are grammar-constrained to be well-formed by construction.
 The `libllama` library resolves from `ENV["WINK_LIBLLAMA"]` or the vendored
 release under `spike/vendor/`.
 
+Loading coordinates the compaction ladder with the model's real ceiling:
+`CONFIG.context_budget` is lowered to 75% of `n_ctx` when it sits above that
+(explicit lower settings are kept; `0` stays disabled, with a warning), so
+folding and distillation fire long before the context window fills.
+
 `local_model!(nothing)` unloads and returns routing to the configured
 provider.
 """
-function local_model!(path::AbstractString; n_ctx::Integer = 16_384,
+function local_model!(path::AbstractString; n_ctx::Integer = 32_768,
         n_gpu_layers::Integer = 99)
     local_model!(nothing)
     if isempty(LibLlama.libllama)
@@ -178,9 +208,11 @@ function local_model!(path::AbstractString; n_ctx::Integer = 16_384,
         LOCAL_ATEXIT[] = true
     end
     CONFIG.chat_model = "local:" * basename(p)
+    budget = _coordinate_budget!(n_ctx)
     printstyled(CONFIG.status_io,
         "  [Wink] local model loaded in-process: ", basename(p),
-        " (n_ctx = $n_ctx, template: $(nameof(typeof(family))))\n";
+        " (n_ctx = $n_ctx, context_budget = $budget, ",
+        "template: $(nameof(typeof(family))))\n";
         color = :light_black)
     return CONFIG.chat_model
 end
@@ -295,6 +327,7 @@ function _local_aitools(lm::LocalModel, history, tools)
             lm.kv_tokens = 0
             toks = _lc_tokenize(lm.vocab, base; add_special = true)
         end
+        _room_check(lm, lm.kv_tokens + length(toks))
         _lc_decode!(lm.ctx, toks)
         lm.kv_tokens += length(toks)
         lm.kv_text = base
@@ -303,6 +336,7 @@ function _local_aitools(lm::LocalModel, history, tools)
         suffix = SubString(full, ncodeunits(base) + 1)
         stoks = isempty(suffix) ? Int32[] :
                 _lc_tokenize(lm.vocab, suffix; add_special = false)
+        _room_check(lm, lm.kv_tokens + length(stoks) + 16)
         scratch += _lc_decode!(lm.ctx, stoks)
 
         gen_grammar = isempty(schemas) ? nothing : tool_call_grammar(schemas)
@@ -315,7 +349,8 @@ function _local_aitools(lm::LocalModel, history, tools)
             call_opened = false
             g = 0
             try
-                while g < CONFIG.max_tokens
+                # cap generation to the room the window actually has left
+                while g < CONFIG.max_tokens && lm.kv_tokens + scratch < lm.n_ctx - 8
                     tok = L.llama_sampler_sample(chain, lm.ctx, Int32(-1))
                     L.llama_vocab_is_eog(lm.vocab, tok) && break
                     s = _lc_piece(lm.vocab, tok)

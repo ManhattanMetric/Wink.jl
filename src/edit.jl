@@ -99,7 +99,9 @@ file on disk; Revise then applies the change to the running session. The match
 must be unique in the file — include enough surrounding lines to disambiguate —
 and must be copied exactly (whitespace included) from `read_file` or
 `get_source` output taken in this conversation; never reconstruct it from
-memory. Editing is limited to the active project and packages loaded for
+memory. IMPORTANT: read_file prefixes every line with `NNN: ` line numbers —
+those prefixes are NOT file content; strip them from `old_string` or the
+match will always fail. Editing is limited to the active project and packages loaded for
 development; stdlib and installed depot packages are read-only. A backup is
 saved before writing. Subject to user confirmation unless auto-approval is on.
 """

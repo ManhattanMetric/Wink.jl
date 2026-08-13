@@ -44,7 +44,8 @@ function handle_ai_input(s::AbstractString)
         e isa InterruptException && return nothing
         printstyled(stdout, "[Wink] error: "; color = :red, bold = true)
         println(stdout, sprint(showerror, e))
-        println(stdout, sprint(Base.show_backtrace, catch_backtrace()))
+        # the message is for the user; the backtrace is for debugging Wink
+        CONFIG.debug && println(stdout, sprint(Base.show_backtrace, catch_backtrace()))
         return nothing
     end
     print_answer(answer)

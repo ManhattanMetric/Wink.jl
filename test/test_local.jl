@@ -66,3 +66,36 @@
         tools = schemas, add_assistant = false)
     @test startswith(r, base)
 end
+
+@testset "local budget coordination" begin
+    old_budget = Wink.CONFIG.context_budget
+    try
+        # the frontier-sized default lowers to 75% of the model's window
+        Wink.CONFIG.context_budget = 100_000
+        @test Wink._coordinate_budget!(32_768) == 24_576
+        @test Wink.CONFIG.context_budget == 24_576
+
+        # an explicit lower setting is respected
+        Wink.CONFIG.context_budget = 8_000
+        @test Wink._coordinate_budget!(32_768) == 8_000
+
+        # disabled stays disabled (warned, not overridden)
+        Wink.CONFIG.context_budget = 0
+        @test (@test_logs (:warn, r"auto-compaction is disabled") Wink._coordinate_budget!(16_384)) == 0
+    finally
+        Wink.CONFIG.context_budget = old_budget
+    end
+
+    # the wall pre-check produces an actionable error, not a C-level one
+    lm_like = (; n_ctx = 1_024, )
+    @test Wink._room_check((; n_ctx = 16_384), 9_000) === nothing
+    err = try
+        Wink._room_check(lm_like, 9_000)
+        nothing
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("context window full", err)
+    @test occursin(":compact", err)
+    @test occursin("n_ctx", err)
+end
