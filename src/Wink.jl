@@ -38,11 +38,17 @@ include("evalengine.jl")
 include("shell.jl")
 include("edit.jl")
 include("rag.jl")
+include("llamacpp/LibLlama.jl")
+const L = LibLlama
+include("llamacpp/render.jl")
+include("llamacpp/grammar.jl")
+include("llamacpp/backend.jl")
 include("agent.jl")
 include("compact.jl")
 include("repl.jl")
 
-export configure!, autoeval!, ask, reset!, compact!, reindex!, index_packages!
+export configure!, autoeval!, ask, reset!, compact!, reindex!, index_packages!,
+       local_model!
 
 function __init__()
     # CONFIG is constructed during precompilation, so its status_io field holds

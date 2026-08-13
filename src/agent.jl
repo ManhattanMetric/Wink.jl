@@ -300,6 +300,10 @@ function execute_tool_call(tool_map::AbstractDict, c::PT.ToolMessage)
 end
 
 function _aitools_call(schema, history, tools)
+    # An in-process model, when loaded, takes the default route; explicit
+    # schemas (tests, overrides) still go through PromptingTools.
+    schema === nothing && LOCAL_MODEL[] !== nothing &&
+        return _local_aitools(LOCAL_MODEL[]::LocalModel, history, tools)
     sch = schema === nothing ? _model_schema(CONFIG.chat_model) : schema
     api_kwargs, key_kwargs = custom_server_kwargs(sch, CONFIG.chat_api_base)
     # Anthropic's default max_tokens of 2048 is far too small for code generation.
