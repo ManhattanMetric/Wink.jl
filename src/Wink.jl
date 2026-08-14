@@ -48,7 +48,7 @@ include("compact.jl")
 include("repl.jl")
 
 export configure!, autoeval!, ask, reset!, compact!, reindex!, index_packages!,
-       local_model!
+       local_model!, local_embed_model!
 
 function __init__()
     # CONFIG is constructed during precompilation, so its status_io field holds

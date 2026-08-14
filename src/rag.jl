@@ -131,12 +131,16 @@ function _aiembed_call(docs, model::AbstractString)
 end
 
 function embed_query(model::AbstractString, query::AbstractString)
+    LOCAL_EMBED[] === nothing ||
+        return vec(_local_embed_texts([String(first(query, 6000))]))
     msg = _aiembed_call(String(first(query, 6000)), model)
     return Float32.(msg.content)
 end
 
 function embed_texts(texts::Vector{String}; model::AbstractString = CONFIG.embed_model,
         io::IO = CONFIG.status_io)
+    LOCAL_EMBED[] === nothing ||
+        return _local_embed_texts(String[first(t, 6000) for t in texts]; io)
     isempty(model) && throw(WinkResolveError("no embedding model configured"))
     cols = Vector{Vector{Float32}}()
     batch = 64
@@ -186,8 +190,9 @@ end
 
 function build_index!(; io::IO = CONFIG.status_io)
     isempty(CONFIG.embed_model) &&
-        throw(WinkResolveError("no embedding provider configured (set " *
-                               "OPENAI_API_KEY, run a local Ollama server, or " *
+        throw(WinkResolveError("no embedding provider configured (load an " *
+                               "in-process embedder with local_embed_model!(gguf), " *
+                               "set OPENAI_API_KEY, run a local Ollama server, or " *
                                "configure!(embed_model = ..., embed_api_base = ...))"))
     chunks = build_corpus()
     isempty(chunks) && throw(WinkResolveError("no documented bindings found to index"))
@@ -304,7 +309,8 @@ tool_search_docs(query::String, top_k::String) = tool_guard("search_docs") do
     k = clamp(something(tryparse(Int, strip(top_k)), 8), 1, 25)
     isempty(CONFIG.embed_model) &&
         return keyword_fallback(q,
-            "no embedding provider (set OPENAI_API_KEY, run a local Ollama " *
+            "no embedding provider (load one in-process with " *
+            "local_embed_model!(gguf), set OPENAI_API_KEY, run a local Ollama " *
             "server, or configure!(embed_model = ..., embed_api_base = ...))")
     idx = ensure_index!()
     idx === nothing &&

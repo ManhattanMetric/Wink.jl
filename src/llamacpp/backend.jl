@@ -201,12 +201,7 @@ function local_model!(path::AbstractString; n_ctx::Integer = 32_768,
               "implemented for the Gemma-4 family; other models run text-only"
 
     LOCAL_MODEL[] = LocalModel(p, model, vocab, ctx, family, Int(n_ctx), "", 0)
-    if !LOCAL_ATEXIT[]
-        # free the Metal context before C++ static destructors run, or ggml's
-        # device teardown asserts on the way out
-        atexit(() -> local_model!(nothing))
-        LOCAL_ATEXIT[] = true
-    end
+    _register_local_atexit!()
     CONFIG.chat_model = "local:" * basename(p)
     budget = _coordinate_budget!(n_ctx)
     printstyled(CONFIG.status_io,
@@ -224,6 +219,129 @@ function local_model!(::Nothing)
     L.llama_free(lm.ctx)
     L.llama_model_free(lm.model)
     return nothing
+end
+
+# Free the Metal contexts before C++ static destructors run, or ggml's device
+# teardown asserts on the way out.
+function _register_local_atexit!()
+    LOCAL_ATEXIT[] && return nothing
+    atexit(() -> (local_model!(nothing); local_embed_model!(nothing)))
+    LOCAL_ATEXIT[] = true
+    return nothing
+end
+
+# ---- in-process embeddings ----------------------------------------------------
+#
+# reindex!/search_docs route their embedding traffic here when an embedder is
+# loaded, completing the no-server story: chat AND retrieval in one process.
+
+mutable struct LocalEmbedder
+    path::String
+    model::Ptr{L.llama_model}
+    vocab::Ptr{L.llama_vocab}
+    ctx::Ptr{L.llama_context}
+    n_embd::Int
+    n_batch::Int
+    use_encode::Bool
+end
+
+const LOCAL_EMBED = Ref{Union{Nothing, LocalEmbedder}}(nothing)
+
+"""
+    local_embed_model!(path::AbstractString; n_ctx = 2_048, n_gpu_layers = 99)
+
+Load an embedding GGUF (e.g. nomic-embed-text) INTO this Julia process and
+route `reindex!`/`search_docs` embedding traffic through it — no embedding
+server needed. Pooling comes from the model's own metadata. Sets
+`CONFIG.embed_model` to a `local:` name so the doc index is cached per model.
+
+`local_embed_model!(nothing)` unloads (dropping the in-memory doc index) and
+clears `embed_model`, degrading doc search to keyword matching until an
+embedding provider is configured again.
+"""
+function local_embed_model!(path::AbstractString; n_ctx::Integer = 2_048,
+        n_gpu_layers::Integer = 99)
+    local_embed_model!(nothing)
+    if isempty(LibLlama.libllama)
+        LibLlama.set_lib!(get(ENV, "WINK_LIBLLAMA", _default_libllama()))
+    end
+    isfile(LibLlama.libllama) ||
+        error("libllama not found at $(LibLlama.libllama) — set " *
+              "ENV[\"WINK_LIBLLAMA\"] to a current llama.cpp dylib")
+    p = expanduser(path)
+    isfile(p) || error("model not found: $p")
+
+    _install_log_filter!()
+    L.llama_backend_init()
+    mp = Ref(L.llama_model_default_params())
+    _poke!(mp, :n_gpu_layers, Int32(n_gpu_layers))
+    model = L.llama_model_load_from_file(p, mp[])
+    model == C_NULL && error("failed to load $p")
+    vocab = L.llama_model_get_vocab(model)
+    cp = Ref(L.llama_context_default_params())
+    _poke!(cp, :n_ctx, UInt32(n_ctx))
+    _poke!(cp, :n_batch, UInt32(n_ctx))
+    # the encoder path asserts n_ubatch >= n_tokens: the whole sequence must
+    # fit one PHYSICAL micro-batch, not just the logical batch
+    _poke!(cp, :n_ubatch, UInt32(n_ctx))
+    _poke!(cp, :embeddings, true)
+    ctx = L.llama_init_from_model(model, cp[])
+    ctx == C_NULL && (L.llama_model_free(model); error("failed to create context"))
+
+    use_encode = L.llama_model_has_encoder(model) && !L.llama_model_has_decoder(model)
+    LOCAL_EMBED[] = LocalEmbedder(p, model, vocab, ctx,
+        Int(L.llama_model_n_embd(model)), Int(n_ctx), use_encode)
+    _register_local_atexit!()
+    CONFIG.embed_model = "local:" * basename(p)
+    printstyled(CONFIG.status_io,
+        "  [Wink] local embedder loaded in-process: ", basename(p),
+        " ($(L.llama_model_n_embd(model)) dims)\n"; color = :light_black)
+    return CONFIG.embed_model
+end
+
+function local_embed_model!(::Nothing)
+    le = LOCAL_EMBED[]
+    le === nothing && return nothing
+    LOCAL_EMBED[] = nothing
+    L.llama_free(le.ctx)
+    L.llama_model_free(le.model)
+    DOC_INDEX[] = nothing
+    startswith(CONFIG.embed_model, "local:") && (CONFIG.embed_model = "")
+    return nothing
+end
+
+"""
+    _local_embed_texts(texts; io = CONFIG.status_io) -> Matrix{Float32}
+
+Embed each text through the in-process embedder; unit-norm columns, matching
+what the RAG index expects. Each text is embedded as its own sequence with a
+cleared cache; over-length texts are token-truncated to the batch size.
+"""
+function _local_embed_texts(texts::Vector{String}; io::IO = CONFIG.status_io)
+    le = LOCAL_EMBED[]
+    le === nothing && error("no local embedder loaded (local_embed_model!)")
+    mem = L.llama_get_memory(le.ctx)
+    cols = Matrix{Float32}(undef, le.n_embd, length(texts))
+    for (i, text) in enumerate(texts)
+        toks = _lc_tokenize(le.vocab, text; add_special = true)
+        length(toks) > le.n_batch && resize!(toks, le.n_batch)
+        L.llama_memory_clear(mem, true)
+        ret = GC.@preserve toks begin
+            batch = L.llama_batch_get_one(pointer(toks), length(toks))
+            le.use_encode ? L.llama_encode(le.ctx, batch) :
+            L.llama_decode(le.ctx, batch)
+        end
+        ret == 0 || error("embedding decode failed with $ret")
+        ptr = L.llama_get_embeddings_seq(le.ctx, 0)
+        ptr == C_NULL && (ptr = L.llama_get_embeddings_ith(le.ctx, Int32(-1)))
+        ptr == C_NULL && error("model returned no embeddings")
+        v = unsafe_wrap(Array, ptr, le.n_embd)
+        n = LinearAlgebra.norm(v)
+        cols[:, i] .= n > 0 ? v ./ n : v
+        i % 50 == 0 && status(io, "embedded $i/$(length(texts)) docstrings")
+        yield()
+    end
+    return cols
 end
 
 # ---- Wink-native history → renderer messages ----------------------------------
