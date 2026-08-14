@@ -187,30 +187,10 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     @test Wink.textual_tool_call("→ eval_code(code=\"1+1\")\nwhich returned 2.",
         tools) === nothing
 
-    # --- trailing-code-block detection (the "I'll run this now" + block +
-    # end-of-turn shape a live demo produced four times) ---
-    @test Wink.trailing_code_block("I'll evaluate this now.\n```julia\nx = 1\n```")
-    @test Wink.trailing_code_block("Setup:\n```\nusing Pkg\nPkg.status()\n```\n")
-    @test !Wink.trailing_code_block("```julia\nx = 1\n```\nThat's how you'd do it.")
-    @test !Wink.trailing_code_block("Use this pattern:\n```bash\nls -la\n```")
-    @test !Wink.trailing_code_block("The answer is 42.")
-    @test !Wink.trailing_code_block("")
-
-    # a reply ending in a code block is nudged toward execution, once per round
-    schema_cb = PT.TestEchoAnthropicSchema(;
-        response = anthropic_text_response(
-            "I'll define the type now.\n```julia\nstruct P end\n```"),
-        status = 200)
-    chat_cb = Wink.new_chat()
-    try
-        Wink.CONFIG.max_rounds = 2
-        Wink.run_turn!(chat_cb, "define P"; schema = schema_cb, io = devnull)
-    finally
-        Wink.CONFIG.max_rounds = old_rounds
-    end
-    @test count(m -> m isa PT.UserMessage &&
-                     occursin("ended with a Julia code block", m.content),
-        chat_cb.history) == 2
+    # --- the "act in the turn you announce" directive is in the prompt (the
+    # mechanical trailing-block nudge was tried and REVERTED: its escape
+    # clause taught the model to dodge by appending chatter after blocks) ---
+    @test occursin("Act in the turn you announce", Wink.system_prompt())
 
     # A reply ending in a textual call is nudged instead of accepted as final:
     # the echo replays the same text every round, so the loop nudges once per

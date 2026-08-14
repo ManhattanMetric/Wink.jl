@@ -211,10 +211,14 @@ function system_prompt()
       briefly explain what you intended or propose an alternative.
     - The "→ tool(...)" lines in this transcript are records of tool calls already
       made. Writing such a line as text runs nothing — invoke tools only through
-      the tool-calling interface. The same goes for fenced code blocks: a
-      ```julia block in your reply executes NOTHING. Never say "I'll run this
-      now" unless you are actually calling eval_code in this same turn; code
-      blocks in prose are for illustration only.
+      the tool-calling interface; fenced code blocks in a reply also execute
+      nothing. Act in the turn you announce: when your next step is running
+      code, editing a file, or a shell command, make that tool call NOW — never
+      end a reply with a promise ("I'll run this now", "Let's go") or with code
+      you claim you are about to execute. And never report an action as done
+      unless a "→ tool(...)" record shows it actually ran: if you did not call
+      the tool, it did NOT happen — do it instead of describing it. End turns
+      only with completed results or a question for the user.
     - Be concise. Put code in fenced blocks. When you changed session state, state
       exactly what changed.
     """
@@ -361,25 +365,6 @@ function textual_tool_call(text::AbstractString, tool_names)
     return name   # parens never closed: the message ends mid-call
 end
 
-# A reply that ENDS with a fenced Julia code block is usually an unexecuted
-# intent — "I'll evaluate this now", a block, end of turn, nothing ran. The
-# companion to textual_tool_call for the fenced-block shape; genuinely
-# illustrative code survives the nudge by not being the reply's last word.
-function trailing_code_block(text::AbstractString)
-    lines = [strip(l) for l in split(text, '\n')]
-    while !isempty(lines) && isempty(last(lines))
-        pop!(lines)
-    end
-    (isempty(lines) || last(lines) != "```") && return false
-    for i in (length(lines) - 1):-1:1
-        if startswith(lines[i], "```")
-            return lowercase(lstrip(lines[i], '`')) in
-                   ("julia", "julia-repl", "jl", "")
-        end
-    end
-    return false
-end
-
 # The recovery reflex, part 2 (part 1 is `api_hint`): spot blind retry streaks.
 # A failed eval_code renders as its error text — "ERROR: ..." or
 # "parse error: ..." from format_for_model, "TOOL ERROR: ..." from the loop's
@@ -433,19 +418,6 @@ function run_turn!(chat::Chat, user_text::AbstractString;
                                        "run it.)"))
                     debug_status(io,
                         "model wrote a tool call as text; asking for a real $(name) call")
-                    continue
-                end
-                if has_tool("eval_code") && trailing_code_block(text)
-                    push!(chat.history,
-                        PT.UserMessage("(system note: your reply ended with a " *
-                                       "Julia code block written as text — NOTHING " *
-                                       "was executed and no file was changed. To " *
-                                       "run it, call eval_code; to create or change " *
-                                       "a file, call write_file or edit_file. If " *
-                                       "the code was only an illustration, finish " *
-                                       "your answer without a trailing code block.)"))
-                    debug_status(io,
-                        "reply ended in a code block; asking for execution or prose")
                     continue
                 end
                 return text
