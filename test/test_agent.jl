@@ -192,6 +192,25 @@ anthropic_tool_response(name, input) = Dict{Symbol, Any}(
     # clause taught the model to dodge by appending chatter after blocks) ---
     @test occursin("Act in the turn you announce", Wink.system_prompt())
 
+    # --- toggling autoeval refreshes the ACTIVE conversation's system prompt
+    # (a stale "OFF" made the model hedge for a whole session) ---
+    old_auto2 = Wink.CONFIG.autoeval
+    try
+        Wink.reset!()
+        Wink.CONFIG.autoeval = false
+        c_live = Wink.current_chat()
+        @test occursin("OFF — the user confirms", c_live.history[1].content)
+        Wink.autoeval!(true)
+        @test occursin("ON — gated calls run without confirmation",
+            c_live.history[1].content)
+        @test occursin("Keep momentum", c_live.history[1].content)
+        Wink.configure!(autoeval = false)
+        @test occursin("OFF — the user confirms", c_live.history[1].content)
+    finally
+        Wink.CONFIG.autoeval = old_auto2
+        Wink.reset!()
+    end
+
     # A reply ending in a textual call is nudged instead of accepted as final:
     # the echo replays the same text every round, so the loop nudges once per
     # round and then falls through to the forced-final path.

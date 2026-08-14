@@ -47,6 +47,19 @@ conversation (with a freshly generated system prompt).
 """
 reset!() = (CHAT[] = nothing; nothing)
 
+# Regenerate the ACTIVE conversation's system message. Without this, toggling
+# autoeval mid-conversation leaves the model reading a stale "OFF — the user
+# confirms each gated call" all session, and it hedges accordingly: batching,
+# deferring, and asking permission for work that no longer needs any. The
+# local backend's KV prefix check absorbs the splice with one re-decode.
+function refresh_system_prompt!()
+    chat = CHAT[]
+    chat === nothing && return nothing
+    !isempty(chat.history) && chat.history[1] isa PT.SystemMessage &&
+        (chat.history[1] = PT.SystemMessage(system_prompt()))
+    return nothing
+end
+
 has_tool(name::AbstractString) = any(p -> p.first == name, TOOL_SPECS)
 
 function loaded_module_summary()
@@ -60,7 +73,9 @@ function loaded_module_summary()
     end
     sort!(unique!(pkgs))
     sort!(unique!(stdlib))
-    return "Loaded packages: " * (isempty(pkgs) ? "(none)" : join(pkgs, ", ")) *
+    return "Loaded packages (in this session's memory NOW; a freshly activated " *
+           "project cannot `using` them until they are added to it): " *
+           (isempty(pkgs) ? "(none)" : join(pkgs, ", ")) *
            "\n- Loaded stdlibs: " * (isempty(stdlib) ? "(none)" : join(stdlib, ", "))
 end
 
@@ -190,7 +205,9 @@ function system_prompt()
     - Active project: $(something(Base.active_project(), "(none)"))
     - Revise is active: edits to package source files apply to the running session
     - Auto-approval of code execution: $(CONFIG.autoeval ?
-        "ON — gated calls run without confirmation" :
+        "ON — gated calls run without confirmation. Keep momentum: carry " *
+        "agreed work straight through its eval/edit/shell steps without " *
+        "pausing to ask" :
         "OFF — the user confirms each gated call. This is a runtime setting, " *
         "not a fixed constraint: when the user asks for uninterrupted flow, " *
         "run Wink.autoeval!(true) via eval_code (they will confirm that one call)")
@@ -218,7 +235,9 @@ function system_prompt()
       you claim you are about to execute. And never report an action as done
       unless a "→ tool(...)" record shows it actually ran: if you did not call
       the tool, it did NOT happen — do it instead of describing it. End turns
-      only with completed results or a question for the user.
+      only with completed results, or with a question ONLY when it is a genuine
+      decision the user must make — never to ask permission to continue work
+      already agreed ("should I proceed?" is not a question, it is a stall).
     - Be concise. Put code in fenced blocks. When you changed session state, state
       exactly what changed.
     """

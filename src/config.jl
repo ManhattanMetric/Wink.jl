@@ -165,7 +165,8 @@ function configure!(; chat_model = nothing, chat_schema = nothing,
             _auto_schema(embed_model, embed_schema, CONFIG.embed_api_base), "embed_model")
         CONFIG.embed_model = String(embed_model)
     end
-    autoeval === nothing || (CONFIG.autoeval = Bool(autoeval))
+    autoeval === nothing ||
+        (CONFIG.autoeval = Bool(autoeval); refresh_system_prompt!())
     max_rounds === nothing || (CONFIG.max_rounds = Int(max_rounds))
     max_tokens === nothing || (CONFIG.max_tokens = Int(max_tokens))
     tool_output_limit === nothing || (CONFIG.tool_output_limit = Int(tool_output_limit))
@@ -198,5 +199,7 @@ end
 Enable (`true`) or disable (`false`) automatic execution of model-proposed code,
 shell commands, and file edits. When disabled (the default) every
 `eval_code`/`run_shell`/`edit_file` tool call asks for y/n confirmation first.
+The active conversation's system prompt is refreshed immediately so the model
+knows the gates changed mid-session.
 """
-autoeval!(flag::Bool) = (CONFIG.autoeval = flag)
+autoeval!(flag::Bool) = (CONFIG.autoeval = flag; refresh_system_prompt!(); flag)
