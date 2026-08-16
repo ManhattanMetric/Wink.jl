@@ -27,6 +27,7 @@ using InteractiveUtils
 import Pkg
 import Downloads
 import JSON3
+import Adapt
 import JuliaSyntaxHighlighting
 
 include("config.jl")
@@ -38,11 +39,15 @@ include("evalengine.jl")
 include("shell.jl")
 include("edit.jl")
 include("rag.jl")
+include("pure/gguf.jl")
+include("pure/tokenizer.jl")
+include("pure/gemma3.jl")
 include("llamacpp/LibLlama.jl")
 const L = LibLlama
 include("llamacpp/render.jl")
 include("llamacpp/grammar.jl")
 include("llamacpp/backend.jl")
+include("pure/backend.jl")
 include("agent.jl")
 include("compact.jl")
 include("repl.jl")

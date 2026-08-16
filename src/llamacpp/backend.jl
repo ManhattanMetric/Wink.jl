@@ -143,26 +143,42 @@ function _coordinate_budget!(n_ctx::Integer)
 end
 
 """
-    local_model!(path::AbstractString; n_ctx = 32_768, n_gpu_layers = 99)
+    local_model!(path::AbstractString; backend = :pure, n_ctx, ...)
 
-Load a GGUF model INTO this Julia process (llama.cpp via LibLlama) and route
-all of Wink's chat through it — no server, no HTTP. The model's chat template
-is read from its own metadata and rendered by the matching `render_chat`
-family; tool calls are grammar-constrained to be well-formed by construction.
-The `libllama` library resolves from `ENV["WINK_LIBLLAMA"]` or the vendored
-release under `spike/vendor/`.
+Load a GGUF model INTO this Julia process and route all of Wink's chat
+through it — no server, no HTTP.
+
+`backend = :pure` (the default) is the pure-Julia backend: GGUF reader,
+SentencePiece tokenizer, and generic-array forward pass, portable to any
+GPUArrays backend via `array` (e.g. `array = MtlArray` with Metal.jl
+loaded). Currently text-only. Defaults to `n_ctx = 16_384`.
+
+`backend = :llamacpp` is PRE-DEPRECATED: it remains only until the pure
+backend qualifies as the local path, and will then be REMOVED — do not
+build on it. It requires a local llama.cpp dylib (`ENV["WINK_LIBLLAMA"]`
+or the vendored release under `spike/vendor/`) and supports
+grammar-constrained tool calls. Defaults to `n_ctx = 32_768`;
+`n_gpu_layers` applies here only.
 
 Loading coordinates the compaction ladder with the model's real ceiling:
-`CONFIG.context_budget` is lowered to 75% of `n_ctx` when it sits above that
-(explicit lower settings are kept; `0` stays disabled, with a warning), so
-folding and distillation fire long before the context window fills.
-
-`local_model!(nothing)` unloads and returns routing to the configured
-provider.
+`CONFIG.context_budget` is lowered to 75% of `n_ctx` when it sits above that.
+`local_model!(nothing)` unloads any local backend and returns routing to the
+configured provider.
 """
-function local_model!(path::AbstractString; n_ctx::Integer = 32_768,
-        n_gpu_layers::Integer = 99)
+function local_model!(path::AbstractString; backend::Symbol = :pure,
+        n_ctx::Integer = backend === :pure ? 16_384 : 32_768,
+        n_gpu_layers::Integer = 99, array = nothing)
     local_model!(nothing)
+    backend === :pure && return _load_pure!(path; n_ctx, array)
+    backend === :llamacpp || error("unknown backend $backend (:pure or :llamacpp)")
+    @warn "backend = :llamacpp is pre-deprecated: it will be removed once " *
+          "the pure-Julia backend qualifies as the local path; do not build " *
+          "on it" maxlog = 1
+    return _load_llamacpp!(path; n_ctx, n_gpu_layers)
+end
+
+function _load_llamacpp!(path::AbstractString; n_ctx::Integer = 32_768,
+        n_gpu_layers::Integer = 99)
     if isempty(LibLlama.libllama)
         LibLlama.set_lib!(get(ENV, "WINK_LIBLLAMA", _default_libllama()))
     end
@@ -213,6 +229,7 @@ function local_model!(path::AbstractString; n_ctx::Integer = 32_768,
 end
 
 function local_model!(::Nothing)
+    PURE_MODEL[] = nothing        # GC handles the pure backend's memory
     lm = LOCAL_MODEL[]
     lm === nothing && return nothing
     LOCAL_MODEL[] = nothing

@@ -67,6 +67,35 @@
     @test startswith(r, base)
 end
 
+@testset "gemma3 template family" begin
+    # detection: gemma-3's start_of_turn family, distinct from gemma-4's
+    @test Wink.template_family("{{ '<start_of_turn>' }}...") isa Wink.Gemma3Template
+    @test Wink.template_family("... '<|turn>' ...") isa Wink.Gemma4Template
+
+    g3 = Wink.Gemma3Template()
+    msgs = [(role = "system", content = "You are terse."),
+        (role = "user", content = "Hi there")]
+    r = Wink.render_chat(g3, msgs; add_assistant = true)
+    # system folds into the first user turn; assistant renders as "model"
+    @test r == "<start_of_turn>user\nYou are terse.\n\nHi there<end_of_turn>\n" *
+               "<start_of_turn>model\n"
+    # base is a strict prefix of full (the KV design invariant)
+    @test startswith(r, Wink.render_chat(g3, msgs; add_assistant = false))
+
+    push!(msgs, (role = "assistant", content = "Hello."))
+    push!(msgs, (role = "user", content = "Bye"))
+    r2 = Wink.render_chat(g3, msgs; add_assistant = true)
+    @test occursin("<start_of_turn>model\nHello.<end_of_turn>\n", r2)
+    @test endswith(r2, "<start_of_turn>user\nBye<end_of_turn>\n<start_of_turn>model\n")
+
+    # text-only: tools are refused, not degraded
+    @test_throws Exception Wink.render_chat(g3, msgs;
+        tools = [Dict("function" => Dict("name" => "f"))])
+
+    # pure backend inactive by default; routing untouched
+    @test Wink.PURE_MODEL[] === nothing
+end
+
 @testset "local budget coordination" begin
     old_budget = Wink.CONFIG.context_budget
     try

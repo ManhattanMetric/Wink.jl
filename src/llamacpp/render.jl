@@ -23,6 +23,7 @@ abstract type ChatTemplate end
 Base.@kwdef struct Gemma4Template <: ChatTemplate
     enable_thinking::Bool = false
 end
+struct Gemma3Template <: ChatTemplate end
 struct NativeTemplate <: ChatTemplate
     template::String
 end
@@ -47,6 +48,8 @@ function template_family(template_text::Union{Nothing, AbstractString};
         native_probe = nothing)
     template_text !== nothing && occursin("<|turn>", template_text) &&
         return Gemma4Template()
+    template_text !== nothing && occursin("start_of_turn", template_text) &&
+        return Gemma3Template()
     template_text !== nothing && native_probe !== nothing && native_probe() &&
         return NativeTemplate(String(template_text))
     return ChatMLTemplate()
@@ -57,6 +60,39 @@ end
 render_chat(::ChatMLTemplate, msgs; tools = (), add_assistant::Bool = true) =
     join("<|im_start|>$(mrole(m))\n$(mcontent(m))<|im_end|>\n" for m in msgs) *
     (add_assistant ? "<|im_start|>assistant\n" : "")
+
+# ---- Gemma 3 ------------------------------------------------------------------
+#
+# The <start_of_turn> family. No system role: a leading system message is
+# folded into the first user turn, per Google's own convention. Text-only —
+# gemma-3 has no canonical tool-call format, so tools are refused rather
+# than degraded.
+
+function render_chat(::Gemma3Template, msgs; tools = (), add_assistant::Bool = true)
+    isempty(tools) ||
+        error("Gemma3Template is text-only (gemma-3 has no canonical " *
+              "tool-call format); tools require another family")
+    io = IOBuffer()
+    sys = ""
+    for m in msgs
+        role = mrole(m)
+        content = strip(mcontent(m))
+        if role in ("system", "developer")
+            sys = isempty(sys) ? String(content) : sys * "\n\n" * content
+            continue
+        end
+        if role == "user" && !isempty(sys)
+            content = sys * "\n\n" * content
+            sys = ""
+        end
+        print(io, "<start_of_turn>", role == "assistant" ? "model" : "user",
+            "\n", content, "<end_of_turn>\n")
+    end
+    isempty(sys) ||   # system with no user turn yet
+        print(io, "<start_of_turn>user\n", sys, "<end_of_turn>\n")
+    add_assistant && print(io, "<start_of_turn>model\n")
+    return String(take!(io))
+end
 
 # ---- Gemma 4 ------------------------------------------------------------------
 #
