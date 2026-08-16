@@ -16,8 +16,11 @@
 #   - sandwich norms: post-attention and post-FFN RMSNorms before residuals
 #   - GELU(tanh) gated FFN; tied output head
 #
-# Sliding-window masking is NOT implemented: sequences must stay under the
-# 512-token window, where local and global attention coincide. Asserted.
+# Generation is KV-cached: `step!` decodes a chunk of new tokens against the
+# cache, and sliding-window attention on local layers is a SLICE of the
+# cached keys/values (the window's lower bound), so sequences past the
+# 512-token window are handled exactly — validated against the llama.cpp
+# oracle on long prompts (test_swa.jl).
 
 module Gemma3
 
@@ -25,7 +28,7 @@ using LinearAlgebra
 
 using ..GGUF: GGUFFile, tensor, metadata
 
-export load_model, forward, generate
+export load_model, forward, generate, KVCache, step!
 
 struct Layer
     attn_norm::Vector{Float32}
@@ -99,12 +102,13 @@ end
 
 gelu_tanh(x) = 0.5f0 * x * (1 + tanh(0.7978845608028654f0 * (x + 0.044715f0 * x^3)))
 
-# NEOX RoPE in place on head_dim × n_heads × T (position = column index - 1)
-function rope!(X::Array{Float32, 3}, base::Float32)
+# NEOX RoPE in place on head_dim × n_heads × T; absolute positions start at
+# pos0 (0-based), so cached decoding rotates by the true sequence position.
+function rope!(X::Array{Float32, 3}, base::Float32; pos0::Int = 0)
     hd, nh, T = size(X)
     half = hd ÷ 2
     for t in 1:T, h in 1:nh, i in 0:(half - 1)
-        θ = (t - 1) * base^(-2.0f0 * i / hd)
+        θ = (pos0 + t - 1) * base^(-2.0f0 * i / hd)
         c, s = cos(θ), sin(θ)
         x1, x2 = X[i + 1, h, t], X[i + 1 + half, h, t]
         X[i + 1, h, t] = x1 * c - x2 * s
@@ -114,20 +118,41 @@ function rope!(X::Array{Float32, 3}, base::Float32)
 end
 
 """
-    forward(m::Model, toks::Vector{<:Integer}) -> Matrix{Float32}
+    KVCache(m::Model; capacity = 4096)
 
-Run the full forward pass over the (0-based) token ids; returns vocab × T
-logits — every position, so the oracle can check them all.
+Per-layer key/value cache. `n` counts the positions already decoded.
 """
-function forward(m::Model, toks::Vector{<:Integer})
+mutable struct KVCache
+    K::Vector{Array{Float32, 3}}   # head_dim × n_kv × capacity, per layer
+    V::Vector{Array{Float32, 3}}
+    n::Int
+    capacity::Int
+end
+
+KVCache(m::Model; capacity::Int = 4096) = KVCache(
+    [zeros(Float32, m.head_dim, m.n_kv, capacity) for _ in m.layers],
+    [zeros(Float32, m.head_dim, m.n_kv, capacity) for _ in m.layers],
+    0, capacity)
+
+"""
+    step!(m::Model, c::KVCache, toks::Vector{<:Integer}) -> Matrix{Float32}
+
+Decode a chunk of new (0-based) token ids against the cache and append their
+keys/values to it. Returns vocab × T logits for the new positions. Local
+(sliding-window) layers attend only to the last `n_swa` positions — done by
+slicing the cache, so long sequences stay exact.
+"""
+function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
     T = length(toks)
-    T <= m.n_swa || error("spike backend caps sequences at the sliding " *
-                          "window ($(m.n_swa) tokens); got $T")
+    P = c.n
+    P + T <= c.capacity ||
+        error("KV cache full ($(c.capacity)); allocate a larger KVCache")
     hd, nh, nkv = m.head_dim, m.n_head, m.n_kv
     scale = 1.0f0 / sqrt(Float32(hd))
     h = m.embd[:, toks .+ 1] .* sqrt(Float32(size(m.embd, 1)))
     for (il, L) in enumerate(m.layers)
-        base = il % m.swa_every == 0 ? m.rope_global : m.rope_local
+        local_layer = il % m.swa_every != 0
+        base = local_layer ? m.rope_local : m.rope_global
         xn = norm_cols(h, L.attn_norm, m.eps)
         q = reshape(L.wq' * xn, hd, nh, T)
         k = reshape(L.wk' * xn, hd, nkv, T)
@@ -140,47 +165,57 @@ function forward(m::Model, toks::Vector{<:Integer})
                 k[:, hh, t] = rmsnorm(view(k, :, hh, t), L.k_norm, m.eps)
             end
         end
-        rope!(q, base)
-        rope!(k, base)
+        rope!(q, base; pos0 = P)
+        rope!(k, base; pos0 = P)
+        c.K[il][:, :, (P + 1):(P + T)] = k
+        c.V[il][:, :, (P + 1):(P + T)] = v
         att = Matrix{Float32}(undef, hd * nh, T)
         for hh in 1:nh
-            kv = 1 + (hh - 1) * nkv ÷ nh           # shared kv head for this head
-            K = @view k[:, kv, :]                  # hd × T
-            V = @view v[:, kv, :]
-            S = (K' * @view(q[:, hh, :])) .* scale # T(keys) × T(queries)
-            for tq in 1:T, tk in (tq + 1):T
-                S[tk, tq] = -Inf32
-            end
+            kv = 1 + (hh - 1) * nkv ÷ nh           # shared kv head (GQA/MQA)
             for tq in 1:T
-                c = view(S, :, tq)
-                c .= exp.(c .- maximum(c))
-                c ./= sum(c)
+                p = P + tq - 1                     # absolute 0-based position
+                lo = local_layer ? max(1, p - m.n_swa + 2) : 1
+                Kv = @view c.K[il][:, kv, lo:(p + 1)]
+                Vv = @view c.V[il][:, kv, lo:(p + 1)]
+                s = (Kv' * view(q, :, hh, tq)) .* scale
+                s .= exp.(s .- maximum(s))
+                s ./= sum(s)
+                att[(1 + (hh - 1) * hd):(hh * hd), tq] = Vv * s
             end
-            att[(1 + (hh - 1) * hd):(hh * hd), :] = V * S
         end
         h .+= norm_cols(L.wo' * att, L.post_attn_norm, m.eps)
         xn2 = norm_cols(h, L.ffn_norm, m.eps)
         act = gelu_tanh.(L.w_gate' * xn2) .* (L.w_up' * xn2)
         h .+= norm_cols(L.w_down' * act, L.post_ffn_norm, m.eps)
     end
+    c.n += T
     return m.embd' * norm_cols(h, m.out_norm, m.eps)
 end
 
 """
+    forward(m::Model, toks::Vector{<:Integer}) -> Matrix{Float32}
+
+Full forward over a sequence (fresh cache); vocab × T logits for every
+position — the oracle-comparison entry point.
+"""
+forward(m::Model, toks::Vector{<:Integer}) =
+    step!(m, KVCache(m; capacity = length(toks)), collect(Int, toks))
+
+"""
     generate(m::Model, toks; max_tokens = 32, eog = Int[]) -> Vector{Int}
 
-Greedy generation by full-forward recompute; returns the new token ids.
+Greedy generation with a KV cache: one prefill, then one step per token.
 """
 function generate(m::Model, toks::Vector{<:Integer}; max_tokens::Int = 32,
         eog::Vector{Int} = Int[])
-    seq = collect(Int, toks)
+    c = KVCache(m; capacity = length(toks) + max_tokens)
+    logits = step!(m, c, collect(Int, toks))
     out = Int[]
     for _ in 1:max_tokens
-        logits = forward(m, seq)
-        next = argmax(view(logits, :, length(seq))) - 1
+        next = argmax(view(logits, :, size(logits, 2))) - 1
         next in eog && break
         push!(out, next)
-        push!(seq, next)
+        logits = step!(m, c, [next])
     end
     return out
 end

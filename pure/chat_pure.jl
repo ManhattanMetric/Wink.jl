@@ -33,4 +33,4 @@ gen = Gemma3.generate(m, ids; max_tokens = 48, eog = [tok.eos, 1])
 dt = time() - t0
 println("\nassistant: ", strip(detokenize(tok, gen)))
 println("\n", length(gen), " tokens in ", round(dt; digits = 1), "s → ",
-    round(length(gen) / dt; digits = 1), " tok/s (CPU, no KV cache, full recompute)")
+    round(length(gen) / dt; digits = 1), " tok/s (CPU, KV-cached)")
