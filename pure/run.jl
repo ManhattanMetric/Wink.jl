@@ -9,6 +9,8 @@ include(joinpath(@__DIR__, "..", "spike", "LibLlama.jl"))
 import .LibLlama as L
 include(joinpath(@__DIR__, "gguf.jl"))
 using .GGUF
+include(joinpath(@__DIR__, "tokenizer.jl"))
+using .SPMTokenizer
 include(joinpath(@__DIR__, "gemma3.jl"))
 using .Gemma3
 using LinearAlgebra
@@ -37,9 +39,9 @@ cp = Ref(L.llama_context_default_params())
 poke!(cp, :n_ctx, UInt32(512))
 ctx = L.llama_init_from_model(lmodel, cp[])
 
-buf = Vector{Int32}(undef, 512)
-n = L.llama_tokenize(vocab, PROMPT, ncodeunits(PROMPT), buf, length(buf), true, true)
-toks = Int.(buf[1:n])
+# the PURE tokenizer feeds both engines; llama.cpp is logits-oracle only
+toks = SPMTokenizer.tokenize(Tokenizer(GGUFFile(MODEL)), PROMPT;
+    add_special = true, parse_special = true)
 piece(t) = (b = Vector{UInt8}(undef, 64);
     len = L.llama_token_to_piece(vocab, Int32(t), b, 64, 0, true);
     String(b[1:max(len, 0)]))
