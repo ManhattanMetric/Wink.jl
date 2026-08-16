@@ -160,6 +160,13 @@ or the vendored release under `spike/vendor/`) and supports
 grammar-constrained tool calls. Defaults to `n_ctx = 32_768`;
 `n_gpu_layers` applies here only.
 
+**Choosing a model:** Wink is a tool-driven agent — every future development
+direction assumes tool calling. Select models on their tool-calling ability
+first; a model that chats beautifully but cannot drive tools is decorative
+here. (This is guidance, not enforced in code: the pure backend is
+temporarily text-only while its constrained-sampling tool support is built,
+but that state is transitional, not a supported configuration to target.)
+
 Loading coordinates the compaction ladder with the model's real ceiling:
 `CONFIG.context_budget` is lowered to 75% of `n_ctx` when it sits above that.
 `local_model!(nothing)` unloads any local backend and returns routing to the
