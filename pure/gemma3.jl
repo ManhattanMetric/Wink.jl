@@ -1,64 +1,66 @@
-# Gemma-3 (dense) inference in pure Julia: plain arrays, LinearAlgebra, and
-# ~150 lines of the actual math. Weights come from the pure GGUF reader; the
-# only ambition here is CORRECTNESS, validated logit-for-logit against
-# llama.cpp on the same file (see run.jl). No KV cache — generation re-runs
-# the full forward on the growing sequence, which at 270M parameters is cheap
-# and keeps every intermediate inspectable.
+# Gemma-3 (dense) inference in generic-array Julia. The forward pass is
+# written against AbstractArray + broadcast + matmul, so the SAME code runs
+# on CPU `Array`s and on any GPUArrays backend (MtlArray, CuArray, ROCArray,
+# oneArray) — move a model with `Adapt.adapt(MtlArray, m)` and everything
+# follows. The one custom kernel (RoPE) is KernelAbstractions, compiled per
+# backend, CPU included: the pattern future quantized-expert kernels will
+# use. No scalar indexing anywhere on the hot path, so GPU array types run
+# it without fallback warnings.
 #
-# Architecture notes (verified against the GGUF metadata and llama.cpp's
-# gemma3 graph):
-#   - embeddings scaled by sqrt(n_embd)
-#   - RMSNorm weights are stored ready-to-multiply (conversion folds the +1)
-#   - GQA/MQA: n_head queries share n_head_kv key/value heads
-#   - per-head QK-norm before RoPE
-#   - NEOX-style RoPE; base 1e6 on global layers, 10k on sliding-window
-#     layers (every 6th layer is global, the rest are local)
-#   - sandwich norms: post-attention and post-FFN RMSNorms before residuals
-#   - GELU(tanh) gated FFN; tied output head
-#
-# Generation is KV-cached: `step!` decodes a chunk of new tokens against the
-# cache, and sliding-window attention on local layers is a SLICE of the
-# cached keys/values (the window's lower bound), so sequences past the
-# 512-token window are handled exactly — validated against the llama.cpp
-# oracle on long prompts (test_swa.jl).
+# Architecture notes (oracle-verified against llama.cpp, see run.jl and
+# test_swa.jl): scaled embeddings; ready-to-multiply RMSNorm weights; MQA
+# with per-head QK-norm; NEOX RoPE with split bases (1e6 global every 6th
+# layer, 1e4 sliding-window local); sandwich post-norms; GELU-tanh gated
+# FFN; tied output head. Sliding-window attention is masking over cached
+# positions; generation is KV-cached via `step!`.
 
 module Gemma3
 
 using LinearAlgebra
+using KernelAbstractions
+import Adapt
 
 using ..GGUF: GGUFFile, tensor, metadata
 
 export load_model, forward, generate, KVCache, step!
 
-struct Layer
-    attn_norm::Vector{Float32}
-    wq::Matrix{Float32}
-    wk::Matrix{Float32}
-    wv::Matrix{Float32}
-    wo::Matrix{Float32}
-    q_norm::Vector{Float32}
-    k_norm::Vector{Float32}
-    post_attn_norm::Vector{Float32}
-    ffn_norm::Vector{Float32}
-    w_gate::Matrix{Float32}
-    w_up::Matrix{Float32}
-    w_down::Matrix{Float32}
-    post_ffn_norm::Vector{Float32}
+struct Layer{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32}}
+    attn_norm::V
+    wq::M
+    wk::M
+    wv::M
+    wo::M
+    q_norm::V
+    k_norm::V
+    post_attn_norm::V
+    ffn_norm::V
+    w_gate::M
+    w_up::M
+    w_down::M
+    post_ffn_norm::V
 end
+Adapt.@adapt_structure Layer
 
-struct Model
-    embd::Matrix{Float32}          # n_embd × vocab (tied output head)
-    layers::Vector{Layer}
-    out_norm::Vector{Float32}
+struct Model{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32}}
+    embd::M                        # n_embd × vocab (tied output head)
+    layers::Vector{Layer{V, M}}
+    out_norm::V
     n_head::Int
     n_kv::Int
     head_dim::Int
     eps::Float32
     rope_global::Float32
     rope_local::Float32
-    swa_every::Int                 # every Nth layer attends globally
-    n_swa::Int                     # sliding window (sequence-length ceiling here)
+    swa_every::Int
+    n_swa::Int
 end
+
+# layers is a plain Vector of structs: map adapt over it rather than trying
+# to turn it into a device array
+Adapt.adapt_structure(to, m::Model) = Model(Adapt.adapt(to, m.embd),
+    [Adapt.adapt(to, L) for L in m.layers], Adapt.adapt(to, m.out_norm),
+    m.n_head, m.n_kv, m.head_dim, m.eps, m.rope_global, m.rope_local,
+    m.swa_every, m.n_swa)
 
 function load_model(f::GGUFFile)
     arch = metadata(f, "general.architecture")
@@ -89,58 +91,71 @@ function load_model(f::GGUFFile)
         Int(metadata(f, "gemma3.attention.sliding_window")))
 end
 
-rmsnorm(x::AbstractVector, w::AbstractVector, eps) =
-    (x ./ sqrt(sum(abs2, x) / length(x) + eps)) .* w
+# ---- generic building blocks --------------------------------------------------
 
-function norm_cols(X::AbstractMatrix, w::AbstractVector, eps)
-    out = similar(X)
-    for j in axes(X, 2)
-        out[:, j] = rmsnorm(view(X, :, j), w, eps)
-    end
-    return out
+# RMSNorm over dim 1, broadcast across everything else — works for n_embd × T
+# matrices and head_dim × heads × T arrays alike.
+function norm1(X::AbstractArray, w::AbstractVector, eps)
+    ms = sum(abs2, X; dims = 1) ./ Float32(size(X, 1))
+    return (X .* w) ./ sqrt.(ms .+ eps)
 end
 
 gelu_tanh(x) = 0.5f0 * x * (1 + tanh(0.7978845608028654f0 * (x + 0.044715f0 * x^3)))
 
-# NEOX RoPE in place on head_dim × n_heads × T; absolute positions start at
-# pos0 (0-based), so cached decoding rotates by the true sequence position.
-function rope!(X::Array{Float32, 3}, base::Float32; pos0::Int = 0)
-    hd, nh, T = size(X)
-    half = hd ÷ 2
-    for t in 1:T, h in 1:nh, i in 0:(half - 1)
-        θ = (pos0 + t - 1) * base^(-2.0f0 * i / hd)
-        c, s = cos(θ), sin(θ)
-        x1, x2 = X[i + 1, h, t], X[i + 1 + half, h, t]
-        X[i + 1, h, t] = x1 * c - x2 * s
-        X[i + 1 + half, h, t] = x1 * s + x2 * c
-    end
+# NEOX RoPE as a KernelAbstractions kernel: one instance per (rot-pair, head,
+# position), compiled for whichever backend owns X.
+@kernel function _rope_kernel!(X, base::Float32, pos0::Int32, half::Int32)
+    i, h, t = @index(Global, NTuple)
+    θ = Float32(pos0 + t - 1) * base^(-2.0f0 * (i - 1) / (2.0f0 * half))
+    c, s = cos(θ), sin(θ)
+    x1 = X[i, h, t]
+    x2 = X[i + half, h, t]
+    X[i, h, t] = x1 * c - x2 * s
+    X[i + half, h, t] = x1 * s + x2 * c
+end
+
+function rope!(X::AbstractArray{Float32, 3}, base::Float32; pos0::Int = 0)
+    half = size(X, 1) ÷ 2
+    _rope_kernel!(get_backend(X))(X, base, Int32(pos0), Int32(half);
+        ndrange = (half, size(X, 2), size(X, 3)))
     return X
 end
+
+# ---- KV cache -----------------------------------------------------------------
 
 """
     KVCache(m::Model; capacity = 4096)
 
-Per-layer key/value cache. `n` counts the positions already decoded.
+Per-layer key/value cache, allocated on the same device as the model's
+arrays. `n` counts the positions already decoded.
 """
-mutable struct KVCache
-    K::Vector{Array{Float32, 3}}   # head_dim × n_kv × capacity, per layer
-    V::Vector{Array{Float32, 3}}
+mutable struct KVCache{A <: AbstractArray{Float32, 3}}
+    K::Vector{A}
+    V::Vector{A}
     n::Int
     capacity::Int
 end
 
 KVCache(m::Model; capacity::Int = 4096) = KVCache(
-    [zeros(Float32, m.head_dim, m.n_kv, capacity) for _ in m.layers],
-    [zeros(Float32, m.head_dim, m.n_kv, capacity) for _ in m.layers],
+    [fill!(similar(m.embd, m.head_dim, m.n_kv, capacity), 0.0f0) for _ in m.layers],
+    [fill!(similar(m.embd, m.head_dim, m.n_kv, capacity), 0.0f0) for _ in m.layers],
     0, capacity)
 
-"""
-    step!(m::Model, c::KVCache, toks::Vector{<:Integer}) -> Matrix{Float32}
+# device-resident index vector for the embedding gather
+function _device_ints(ref::AbstractArray, xs::Vector{Int})
+    out = KernelAbstractions.allocate(get_backend(ref), Int, length(xs))
+    copyto!(out, xs)
+    return out
+end
 
-Decode a chunk of new (0-based) token ids against the cache and append their
-keys/values to it. Returns vocab × T logits for the new positions. Local
-(sliding-window) layers attend only to the last `n_swa` positions — done by
-slicing the cache, so long sequences stay exact.
+# ---- the forward pass ---------------------------------------------------------
+
+"""
+    step!(m::Model, c::KVCache, toks::Vector{<:Integer}) -> logits (vocab × T)
+
+Decode a chunk of new (0-based) token ids against the cache. Attention is
+batched matmul per head; causal and sliding-window constraints are one
+broadcasted mask over (key position, query position).
 """
 function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
     T = length(toks)
@@ -149,54 +164,50 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
         error("KV cache full ($(c.capacity)); allocate a larger KVCache")
     hd, nh, nkv = m.head_dim, m.n_head, m.n_kv
     scale = 1.0f0 / sqrt(Float32(hd))
-    h = m.embd[:, toks .+ 1] .* sqrt(Float32(size(m.embd, 1)))
+    idx = _device_ints(m.embd, collect(Int, toks) .+ 1)
+    h = m.embd[:, idx] .* sqrt(Float32(size(m.embd, 1)))
+    kq = reshape(0:(P + T - 1), :, 1)          # key positions (0-based)
+    qq = reshape(P:(P + T - 1), 1, :)          # query positions
     for (il, L) in enumerate(m.layers)
-        local_layer = il % m.swa_every != 0
-        base = local_layer ? m.rope_local : m.rope_global
-        xn = norm_cols(h, L.attn_norm, m.eps)
-        q = reshape(L.wq' * xn, hd, nh, T)
-        k = reshape(L.wk' * xn, hd, nkv, T)
-        v = reshape(L.wv' * xn, hd, nkv, T)
-        for t in 1:T
-            for hh in 1:nh
-                q[:, hh, t] = rmsnorm(view(q, :, hh, t), L.q_norm, m.eps)
-            end
-            for hh in 1:nkv
-                k[:, hh, t] = rmsnorm(view(k, :, hh, t), L.k_norm, m.eps)
-            end
-        end
-        rope!(q, base; pos0 = P)
-        rope!(k, base; pos0 = P)
+        loc = il % m.swa_every != 0
+        base = loc ? m.rope_local : m.rope_global
+        xn = norm1(h, L.attn_norm, m.eps)
+        q = rope!(norm1(reshape(L.wq' * xn, hd, nh, T), L.q_norm, m.eps),
+            base; pos0 = P)
+        k = rope!(norm1(reshape(L.wk' * xn, hd, nkv, T), L.k_norm, m.eps),
+            base; pos0 = P)
         c.K[il][:, :, (P + 1):(P + T)] = k
-        c.V[il][:, :, (P + 1):(P + T)] = v
-        att = Matrix{Float32}(undef, hd * nh, T)
+        c.V[il][:, :, (P + 1):(P + T)] = reshape(L.wv' * xn, hd, nkv, T)
+        att = similar(h, hd * nh, T)
         for hh in 1:nh
-            kv = 1 + (hh - 1) * nkv ÷ nh           # shared kv head (GQA/MQA)
-            for tq in 1:T
-                p = P + tq - 1                     # absolute 0-based position
-                lo = local_layer ? max(1, p - m.n_swa + 2) : 1
-                Kv = @view c.K[il][:, kv, lo:(p + 1)]
-                Vv = @view c.V[il][:, kv, lo:(p + 1)]
-                s = (Kv' * view(q, :, hh, tq)) .* scale
-                s .= exp.(s .- maximum(s))
-                s ./= sum(s)
-                att[(1 + (hh - 1) * hd):(hh * hd), tq] = Vv * s
-            end
+            kv = 1 + (hh - 1) * nkv ÷ nh       # shared kv head (GQA/MQA)
+            Kc = @view c.K[il][:, kv, 1:(P + T)]
+            Vc = @view c.V[il][:, kv, 1:(P + T)]
+            S = (Kc' * q[:, hh, :]) .* scale   # (P+T) × T
+            # mask FUSED into one device broadcast: the ranges are isbits and
+            # ride into the kernel; a separate range-only broadcast would
+            # materialize a CPU BitMatrix and poison GPU compilation
+            S = loc ?
+                ifelse.((kq .<= qq) .& (qq .- kq .< m.n_swa), S, -Inf32) :
+                ifelse.(kq .<= qq, S, -Inf32)
+            S = exp.(S .- maximum(S; dims = 1))
+            S ./= sum(S; dims = 1)
+            att[(1 + (hh - 1) * hd):(hh * hd), :] = Vc * S
         end
-        h .+= norm_cols(L.wo' * att, L.post_attn_norm, m.eps)
-        xn2 = norm_cols(h, L.ffn_norm, m.eps)
+        h .+= norm1(L.wo' * att, L.post_attn_norm, m.eps)
+        xn2 = norm1(h, L.ffn_norm, m.eps)
         act = gelu_tanh.(L.w_gate' * xn2) .* (L.w_up' * xn2)
-        h .+= norm_cols(L.w_down' * act, L.post_ffn_norm, m.eps)
+        h .+= norm1(L.w_down' * act, L.post_ffn_norm, m.eps)
     end
     c.n += T
-    return m.embd' * norm_cols(h, m.out_norm, m.eps)
+    return m.embd' * norm1(h, m.out_norm, m.eps)
 end
 
 """
-    forward(m::Model, toks::Vector{<:Integer}) -> Matrix{Float32}
+    forward(m::Model, toks::Vector{<:Integer}) -> logits (vocab × T)
 
-Full forward over a sequence (fresh cache); vocab × T logits for every
-position — the oracle-comparison entry point.
+Full forward over a sequence (fresh cache); every position's logits — the
+oracle-comparison entry point.
 """
 forward(m::Model, toks::Vector{<:Integer}) =
     step!(m, KVCache(m; capacity = length(toks)), collect(Int, toks))
@@ -212,7 +223,7 @@ function generate(m::Model, toks::Vector{<:Integer}; max_tokens::Int = 32,
     logits = step!(m, c, collect(Int, toks))
     out = Int[]
     for _ in 1:max_tokens
-        next = argmax(view(logits, :, size(logits, 2))) - 1
+        next = Int(argmax(view(logits, :, size(logits, 2)))) - 1
         next in eog && break
         push!(out, next)
         logits = step!(m, c, [next])

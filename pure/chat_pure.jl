@@ -4,7 +4,7 @@
 # no ccalls. (llama.cpp survives in this directory solely as the dev-time
 # oracle behind run.jl and test_tokenizer.jl.)
 #
-# Run: julia pure/chat_pure.jl [prompt]
+# Run: julia --project=pure pure/chat_pure.jl [prompt]
 
 include(joinpath(@__DIR__, "gguf.jl"))
 using .GGUF
