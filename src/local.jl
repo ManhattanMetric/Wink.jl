@@ -178,20 +178,36 @@ end
 # ---- sampling -----------------------------------------------------------------
 
 # temperature + top-k sampling over one logits column (host-side; we own
-# the sampler loop, which is what makes constrained tool calls possible)
+# the sampler loop, which is what makes constrained tool calls possible).
+# Single pass with a small insertion-sorted top-k — partialsortperm would
+# allocate a full index permutation of the 262k vocab per token.
 function _local_sample(logits::AbstractVector{Float32}; temp::Float32 = 0.7f0,
         top_k::Int = 40)
     temp <= 0 && return Int(argmax(logits)) - 1
-    idx = partialsortperm(logits, 1:min(top_k, length(logits)); rev = true)
-    w = exp.((logits[idx] .- logits[idx[1]]) ./ temp)
+    k = min(top_k, length(logits))
+    idx = Vector{Int}(undef, k)
+    val = fill(-Inf32, k)
+    @inbounds for i in eachindex(logits)
+        x = logits[i]
+        x <= val[k] && continue
+        j = k
+        while j > 1 && val[j - 1] < x
+            val[j] = val[j - 1]
+            idx[j] = idx[j - 1]
+            j -= 1
+        end
+        val[j] = x
+        idx[j] = i
+    end
+    w = exp.((val .- val[1]) ./ temp)
     w ./= sum(w)
     r = rand(Float32)
     acc = 0.0f0
-    for (i, p) in zip(idx, w)
-        acc += p
-        acc >= r && return Int(i) - 1
+    @inbounds for j in 1:k
+        acc += w[j]
+        acc >= r && return idx[j] - 1
     end
-    return Int(idx[end]) - 1
+    return idx[k] - 1
 end
 
 # ---- Wink-native history → renderer messages ----------------------------------
