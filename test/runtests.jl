@@ -25,6 +25,19 @@ using TestPkg
     include("test_repl.jl")
     include("test_edit.jl")
     include("test_rag.jl")
+    # the pure/ spike dir hosts the llama.cpp oracle batteries against the
+    # SAME engine files that ship in src/pure/ — they must not drift
+    let spike = joinpath(dirname(@__DIR__), "pure")
+        if isdir(spike)   # dev checkouts only
+            @testset "spike/src engine sync" begin
+                for f in ("quant.jl", "gguf.jl", "tokenizer.jl",
+                          "gemma3.jl", "gemma4.jl", "olmoe.jl")
+                    @test read(joinpath(spike, f), String) ==
+                          read(joinpath(dirname(@__DIR__), "src", "pure", f), String)
+                end
+            end
+        end
+    end
     if get(ENV, "WINK_LIVE_TESTS", "") == "true"
         include("live/runtests.jl")
     end

@@ -10,13 +10,18 @@ module GGUF
 
 using Mmap
 
-export GGUFFile, tensor, metadata
+using ..Quant: Q4_0Matrix, Q8_0Matrix, Q6_KMatrix
+
+export GGUFFile, tensor, metadata, raw_tensor
 
 const MAGIC = 0x46554747   # "GGUF" little-endian
 
 # ggml tensor types we materialize
 const T_F32 = UInt32(0)
 const T_F16 = UInt32(1)
+const T_Q4_0 = UInt32(2)
+const T_Q8_0 = UInt32(8)
+const T_Q6_K = UInt32(14)
 const T_BF16 = UInt32(30)
 
 # metadata value types
@@ -127,6 +132,17 @@ function tensor(f::GGUFFile, name::AbstractString; T::Type = Float32)
     ti === nothing && error("no tensor named $name (have $(length(f.tensors)))")
     n = prod(ti.dims)
     off = Int(ti.offset)
+    if ti.typ in (T_Q4_0, T_Q8_0, T_Q6_K)
+        length(ti.dims) == 2 ||
+            error("quantized tensor $name is $(length(ti.dims))-D; use " *
+                  "raw_tensor + per-slab construction for 3-D expert tensors")
+        qk, bpb, QT = ti.typ == T_Q4_0 ? (32, 18, Q4_0Matrix) :
+                      ti.typ == T_Q8_0 ? (32, 34, Q8_0Matrix) :
+                      (256, 210, Q6_KMatrix)
+        nbytes = (ti.dims[1] ÷ qk) * bpb * ti.dims[2]
+        # ZERO-COPY: the matrix reads straight out of the mmap
+        return QT(view(f.data, (off + 1):(off + nbytes)), ti.dims[1], ti.dims[2])
+    end
     raw = if ti.typ == T_F32
         reinterpret(Float32, view(f.data, (off + 1):(off + 4n)))
     elseif ti.typ == T_F16
@@ -138,6 +154,24 @@ function tensor(f::GGUFFile, name::AbstractString; T::Type = Float32)
               "unquantized (F16/BF16/F32) GGUFs only")
     end
     return reshape(T.(raw), ti.dims...)
+end
+
+"""
+    raw_tensor(f, name) -> (bytes_view, dims, typ)
+
+Raw access to a tensor's mmap'd bytes — for callers that build their own
+views (e.g. per-expert slabs of 3-D quantized tensors).
+"""
+function raw_tensor(f::GGUFFile, name::AbstractString)
+    ti = get(f.tensors, name, nothing)
+    ti === nothing && error("no tensor named $name")
+    qk, bpb = ti.typ == T_Q4_0 ? (32, 18) : ti.typ == T_Q8_0 ? (32, 34) :
+              ti.typ == T_Q6_K ? (256, 210) :
+              ti.typ == T_F32 ? (1, 4) : ti.typ == T_F16 ? (1, 2) :
+              error("raw_tensor: unsupported type $(ti.typ)")
+    nbytes = (prod(ti.dims) ÷ qk) * bpb
+    off = Int(ti.offset)
+    return view(f.data, (off + 1):(off + nbytes)), ti.dims, ti.typ
 end
 
 end # module GGUF

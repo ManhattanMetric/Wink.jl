@@ -148,24 +148,28 @@ end
 Load a GGUF model INTO this Julia process and route all of Wink's chat
 through it — no server, no HTTP.
 
-`backend = :pure` (the default) is the pure-Julia backend: GGUF reader,
-SentencePiece tokenizer, and generic-array forward pass, portable to any
-GPUArrays backend via `array` (e.g. `array = MtlArray` with Metal.jl
-loaded). Currently text-only. Defaults to `n_ctx = 16_384`.
+`backend = :pure` (the default) is the pure-Julia backend: GGUF reader
+(F32/F16/BF16 + q4_0/q8_0/q6_K zero-copy over the mmap), SPM and GPT-2 BPE
+tokenizers, and generic-array forward passes for gemma-3, gemma-4 (MoE),
+and OLMoE — all oracle-validated against llama.cpp. Tool calls are
+constrained at the logits (a malformed call is unrepresentable) on
+template families with a canonical call syntax (gemma-4); other families
+run text-only. `array = MtlArray` (with Metal.jl loaded — any GPUArrays
+vendor package works) keeps a device twin of the weights for prefill,
+where batch puts the GPU ~4× ahead, while generation stays on the host
+mmap-backed model, where launch latency makes the CPU the fast device.
+Defaults to `n_ctx = 16_384`.
 
 `backend = :llamacpp` is PRE-DEPRECATED: it remains only until the pure
 backend qualifies as the local path, and will then be REMOVED — do not
 build on it. It requires a local llama.cpp dylib (`ENV["WINK_LIBLLAMA"]`
-or the vendored release under `spike/vendor/`) and supports
-grammar-constrained tool calls. Defaults to `n_ctx = 32_768`;
-`n_gpu_layers` applies here only.
+or the vendored release under `spike/vendor/`). Defaults to
+`n_ctx = 32_768`; `n_gpu_layers` applies here only.
 
 **Choosing a model:** Wink is a tool-driven agent — every future development
 direction assumes tool calling. Select models on their tool-calling ability
 first; a model that chats beautifully but cannot drive tools is decorative
-here. (This is guidance, not enforced in code: the pure backend is
-temporarily text-only while its constrained-sampling tool support is built,
-but that state is transitional, not a supported configuration to target.)
+here. (This is guidance, not enforced in code.)
 
 Loading coordinates the compaction ladder with the model's real ceiling:
 `CONFIG.context_budget` is lowered to 75% of `n_ctx` when it sits above that.

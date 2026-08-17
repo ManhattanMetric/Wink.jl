@@ -24,27 +24,27 @@ using ..GGUF: GGUFFile, tensor, metadata
 
 export load_model, forward, generate, KVCache, step!
 
-struct Layer{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32}}
-    attn_norm::V
-    wq::M
-    wk::M
-    wv::M
-    wo::M
-    q_norm::V
-    k_norm::V
-    post_attn_norm::V
-    ffn_norm::V
-    w_gate::M
-    w_up::M
-    w_down::M
-    post_ffn_norm::V
+struct Layer
+    attn_norm::AbstractVector{Float32}
+    wq::AbstractMatrix{Float32}
+    wk::AbstractMatrix{Float32}
+    wv::AbstractMatrix{Float32}
+    wo::AbstractMatrix{Float32}
+    q_norm::AbstractVector{Float32}
+    k_norm::AbstractVector{Float32}
+    post_attn_norm::AbstractVector{Float32}
+    ffn_norm::AbstractVector{Float32}
+    w_gate::AbstractMatrix{Float32}
+    w_up::AbstractMatrix{Float32}
+    w_down::AbstractMatrix{Float32}
+    post_ffn_norm::AbstractVector{Float32}
 end
 Adapt.@adapt_structure Layer
 
-struct Model{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32}}
-    embd::M                        # n_embd × vocab (tied output head)
-    layers::Vector{Layer{V, M}}
-    out_norm::V
+struct Model
+    embd::AbstractMatrix{Float32}  # n_embd × vocab (tied output head)
+    layers::Vector{Layer}
+    out_norm::AbstractVector{Float32}
     n_head::Int
     n_kv::Int
     head_dim::Int
