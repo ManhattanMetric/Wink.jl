@@ -8,6 +8,7 @@
 
 include(joinpath(@__DIR__, "..", "spike", "LibLlama.jl"))
 import .LibLlama as L
+include(joinpath(@__DIR__, "quant.jl"))
 include(joinpath(@__DIR__, "gguf.jl"))
 using .GGUF
 include(joinpath(@__DIR__, "tokenizer.jl"))

@@ -10,6 +10,8 @@ module GGUF
 
 using Mmap
 
+using ..Quant: Q4_0Matrix, Q8_0Matrix
+
 export GGUFFile, tensor, metadata
 
 const MAGIC = 0x46554747   # "GGUF" little-endian
@@ -17,6 +19,8 @@ const MAGIC = 0x46554747   # "GGUF" little-endian
 # ggml tensor types we materialize
 const T_F32 = UInt32(0)
 const T_F16 = UInt32(1)
+const T_Q4_0 = UInt32(2)
+const T_Q8_0 = UInt32(8)
 const T_BF16 = UInt32(30)
 
 # metadata value types
@@ -127,6 +131,16 @@ function tensor(f::GGUFFile, name::AbstractString; T::Type = Float32)
     ti === nothing && error("no tensor named $name (have $(length(f.tensors)))")
     n = prod(ti.dims)
     off = Int(ti.offset)
+    if ti.typ in (T_Q4_0, T_Q8_0)
+        length(ti.dims) == 2 ||
+            error("quantized tensor $name is $(length(ti.dims))-D; only " *
+                  "matrices are supported so far")
+        bpb = ti.typ == T_Q4_0 ? 18 : 34
+        QT = ti.typ == T_Q4_0 ? Q4_0Matrix : Q8_0Matrix
+        nbytes = (ti.dims[1] ÷ 32) * bpb * ti.dims[2]
+        return QT(Vector(view(f.data, (off + 1):(off + nbytes))),
+            ti.dims[1], ti.dims[2])
+    end
     raw = if ti.typ == T_F32
         reinterpret(Float32, view(f.data, (off + 1):(off + 4n)))
     elseif ti.typ == T_F16

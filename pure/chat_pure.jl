@@ -6,6 +6,7 @@
 #
 # Run: julia --project=pure pure/chat_pure.jl [prompt]
 
+include(joinpath(@__DIR__, "quant.jl"))
 include(joinpath(@__DIR__, "gguf.jl"))
 using .GGUF
 include(joinpath(@__DIR__, "tokenizer.jl"))

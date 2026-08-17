@@ -5,6 +5,7 @@
 #
 # Run: julia --project=spike pure/test_metal.jl
 
+include(joinpath(@__DIR__, "quant.jl"))
 include(joinpath(@__DIR__, "gguf.jl"))
 using .GGUF
 include(joinpath(@__DIR__, "tokenizer.jl"))
