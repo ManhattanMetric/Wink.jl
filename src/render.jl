@@ -29,6 +29,14 @@ struct NativeTemplate <: ChatTemplate
 end
 struct ChatMLTemplate <: ChatTemplate end
 
+# The pieces that END a model turn under each family — generation must stop
+# on these. GGUF metadata often omits eot_token_id (gemma-4's does);
+# llama.cpp compensates with a hardcoded piece list in its vocab loader,
+# and this is our equivalent, keyed by family instead of guessed globally.
+stop_pieces(::Gemma4Template) = ("<turn|>", "<eos>")
+stop_pieces(::Gemma3Template) = ("<end_of_turn>", "<eos>")
+stop_pieces(::ChatTemplate) = ("<|im_end|>", "<|endoftext|>", "<eos>", "<eot>")
+
 # Field access over NamedTuples and Dicts alike.
 field(m, k::Symbol, default = nothing) = m isa AbstractDict ?
     get(m, String(k), get(m, k, default)) :

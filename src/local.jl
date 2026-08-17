@@ -117,9 +117,8 @@ function local_model!(path::AbstractString; n_ctx::Integer = 16_384,
     family = template_family(get(f.meta, "tokenizer.chat_template", nothing))
     family isa ChatMLTemplate &&
         @warn "unrecognized chat template family; ChatML fallback will degrade output"
-    eog = unique(filter(>=(0), [tok.eos,
-        get(tok.id_of, "<eos>", -1), get(tok.id_of, "<end_of_turn>", -1),
-        get(tok.id_of, "<eot>", -1), get(tok.id_of, "<|endoftext|>", -1)]))
+    eog = unique(filter(>=(0), vcat(tok.eos,
+        [get(tok.id_of, p, -1) for p in stop_pieces(family)])))
     LOCAL_MODEL[] = LocalModel(p, engine, m, gpu, tokmod, tok, family,
         engine.KVCache(m; capacity = Int(n_ctx)), "", Int(n_ctx), eog)
     CONFIG.chat_model = "local:" * basename(p)
