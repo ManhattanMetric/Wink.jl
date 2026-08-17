@@ -41,7 +41,7 @@ struct Layer
     hd::Int
     nh::Int
     nkv::Int
-    attn_norm::Vector{Float32}
+    attn_norm::AbstractVector{Float32}
     wq::AbstractMatrix{Float32}
     wk::AbstractMatrix{Float32}
     wv::Union{Nothing, AbstractMatrix{Float32}}  # absent on some layers: V = raw K projection
@@ -50,23 +50,23 @@ struct Layer
     wk_s::Float32
     wv_s::Float32
     wo_s::Float32
-    q_norm::Vector{Float32}
-    k_norm::Vector{Float32}
-    attn_post_norm::Vector{Float32}
+    q_norm::AbstractVector{Float32}
+    k_norm::AbstractVector{Float32}
+    attn_post_norm::AbstractVector{Float32}
     out_scale::Float32
-    ffn_norm::Vector{Float32}
+    ffn_norm::AbstractVector{Float32}
     ffn_gate::AbstractMatrix{Float32}
     ffn_up::AbstractMatrix{Float32}
     ffn_down::AbstractMatrix{Float32}
     ffn_gate_s::Float32
     ffn_up_s::Float32
     ffn_down_s::Float32
-    ffn_post_norm::Vector{Float32}
-    ffn_post_norm_1::Vector{Float32}
-    ffn_pre_norm_2::Vector{Float32}
-    ffn_post_norm_2::Vector{Float32}
-    gate_inp::Matrix{Float32}
-    gate_inp_s::Vector{Float32}
+    ffn_post_norm::AbstractVector{Float32}
+    ffn_post_norm_1::AbstractVector{Float32}
+    ffn_pre_norm_2::AbstractVector{Float32}
+    ffn_post_norm_2::AbstractVector{Float32}
+    gate_inp::AbstractMatrix{Float32}
+    gate_inp_s::AbstractVector{Float32}
     gate_up_exps::Vector{<:AbstractMatrix{Float32}}   # per-expert [n_embd, 2n_ff]
     down_exps::Vector{<:AbstractMatrix{Float32}}      # per-expert [n_ff, n_embd]
     down_exps_s::Vector{Float32}
@@ -76,8 +76,8 @@ struct Model
     embd::AbstractMatrix{Float32}     # q6_K, gather only
     output::AbstractMatrix{Float32}   # separate head
     layers::Vector{Layer}
-    out_norm::Vector{Float32}
-    rope_factors::Vector{Float32}     # shared, global layers only
+    out_norm::AbstractVector{Float32}
+    rope_factors::AbstractVector{Float32}  # shared, global layers only
     n_embd::Int
     n_expert_used::Int
     eps::Float32
@@ -190,22 +190,51 @@ end
 function rope!(X::AbstractArray{Float32, 3}, base::Float32, factors;
         pos0::Int = 0)
     half = size(X, 1) ÷ 2
-    fac = length(factors) == half ? factors : ones(Float32, half)
+    fac = length(factors) == half ? factors :
+        fill!(KernelAbstractions.allocate(get_backend(X), Float32, half), 1.0f0)
     _rope_kernel!(get_backend(X))(X, base, Int32(pos0), Int32(half), fac;
         ndrange = (half, size(X, 2), size(X, 3)))
     return X
 end
 
-mutable struct KVCache
-    K::Vector{Array{Float32, 3}}
-    V::Vector{Array{Float32, 3}}
+# Single-token attention as two fused kernels (one launch each) instead of a
+# per-head loop of small matmuls — at 48 layers the launch count is what
+# throttles the GPU, not the math. Scores mask the sliding window in-kernel.
+@kernel function _attn1_scores!(S, @Const(K), @Const(q), hpk::Int32,
+        wstart::Int32)
+    pos, hh = @index(Global, NTuple)
+    if pos < Int(wstart)
+        @inbounds S[pos, hh] = -Inf32
+    else
+        kv = (hh - 1) ÷ Int(hpk) + 1
+        s = 0.0f0
+        @inbounds for d in 1:size(K, 1)
+            s = muladd(K[d, kv, pos], q[d, hh], s)
+        end
+        @inbounds S[pos, hh] = s
+    end
+end
+
+@kernel function _attn1_out!(att, @Const(V), @Const(S), hpk::Int32, hd::Int32)
+    d, hh = @index(Global, NTuple)
+    kv = (hh - 1) ÷ Int(hpk) + 1
+    s = 0.0f0
+    @inbounds for pos in 1:size(S, 1)
+        s = muladd(V[d, kv, pos], S[pos, hh], s)
+    end
+    @inbounds att[(hh - 1) * Int(hd) + d, 1] = s
+end
+
+mutable struct KVCache{A <: AbstractArray{Float32, 3}}
+    K::Vector{A}
+    V::Vector{A}
     n::Int
     capacity::Int
 end
 
 KVCache(m::Model; capacity::Int = 4096) = KVCache(
-    [zeros(Float32, L.hd, L.nkv, capacity) for L in m.layers],
-    [zeros(Float32, L.hd, L.nkv, capacity) for L in m.layers],
+    [fill!(similar(L.attn_norm, L.hd, L.nkv, capacity), 0.0f0) for L in m.layers],
+    [fill!(similar(L.attn_norm, L.hd, L.nkv, capacity), 0.0f0) for L in m.layers],
     0, capacity)
 
 # ---- the forward pass ---------------------------------------------------------
@@ -216,7 +245,8 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
     P + T <= c.capacity ||
         error("KV cache full ($(c.capacity)); allocate a larger KVCache")
     inv_sqrt_embd = 1.0f0 / sqrt(Float32(m.n_embd))
-    h = m.embd[:, collect(Int, toks) .+ 1] .* sqrt(Float32(m.n_embd))
+    h0 = m.embd[:, collect(Int, toks) .+ 1] .* sqrt(Float32(m.n_embd))
+    h = copyto!(similar(c.K[1], m.n_embd, T), h0)
     kq = reshape(0:(P + T - 1), :, 1)
     qq = reshape(P:(P + T - 1), 1, :)
     for (il, L) in enumerate(m.layers)
@@ -234,17 +264,29 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
         c.K[il][:, :, (P + 1):(P + T)] = k
         c.V[il][:, :, (P + 1):(P + T)] = v
         att = similar(h, hd * nh, T)
-        for hh in 1:nh
-            kv = 1 + (hh - 1) * nkv ÷ nh
-            Kc = @view c.K[il][:, kv, 1:(P + T)]
-            Vc = @view c.V[il][:, kv, 1:(P + T)]
-            S = Kc' * q[:, hh, :]              # attention scale is 1.0!
-            S = L.is_swa ?
-                ifelse.((kq .<= qq) .& (qq .- kq .< m.n_swa), S, -Inf32) :
-                ifelse.(kq .<= qq, S, -Inf32)
+        if T == 1
+            Kp = P + 1
+            wstart = L.is_swa ? max(1, Kp - m.n_swa + 1) : 1
+            S = similar(h, Kp, nh)
+            _attn1_scores!(get_backend(S))(S, c.K[il], reshape(q, hd, nh),
+                Int32(nh ÷ nkv), Int32(wstart); ndrange = (Kp, nh))
             S = exp.(S .- maximum(S; dims = 1))
             S ./= sum(S; dims = 1)
-            att[(1 + (hh - 1) * hd):(hh * hd), :] = Vc * S
+            _attn1_out!(get_backend(att))(att, c.V[il], S, Int32(nh ÷ nkv),
+                Int32(hd); ndrange = (hd, nh))
+        else
+            for hh in 1:nh
+                kv = 1 + (hh - 1) * nkv ÷ nh
+                Kc = @view c.K[il][:, kv, 1:(P + T)]
+                Vc = @view c.V[il][:, kv, 1:(P + T)]
+                S = Kc' * q[:, hh, :]          # attention scale is 1.0!
+                S = L.is_swa ?
+                    ifelse.((kq .<= qq) .& (qq .- kq .< m.n_swa), S, -Inf32) :
+                    ifelse.(kq .<= qq, S, -Inf32)
+                S = exp.(S .- maximum(S; dims = 1))
+                S ./= sum(S; dims = 1)
+                att[(1 + (hh - 1) * hd):(hh * hd), :] = Vc * S
+            end
         end
         attno = (L.wo' * att) .* L.wo_s
         attn_out = norm1(attno, L.attn_post_norm, m.eps) .+ h
@@ -258,21 +300,34 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
         rlog = L.gate_inp' * tmp                       # n_expert × T
         p = exp.(rlog .- maximum(rlog; dims = 1))
         p ./= sum(p; dims = 1)
+        pc = Array(p)                                  # routing is host-side
         # expert branch
         moe_in = norm1(attn_out, L.ffn_pre_norm_2, m.eps)
-        moe = zeros(Float32, size(attn_out))
+        moe = fill!(similar(attn_out), 0.0f0)
         nf = size(L.down_exps[1], 1)
-        sel = [partialsortperm(view(p, :, t), 1:m.n_expert_used; rev = true)
+        sel = [partialsortperm(view(pc, :, t), 1:m.n_expert_used; rev = true)
                for t in 1:T]
-        wsum = [max(sum(p[e, t] for e in sel[t]), 6.103515625f-5) for t in 1:T]
-        for e in 1:length(L.gate_up_exps)
-            cols = [t for t in 1:T if e in sel[t]]
-            isempty(cols) && continue
-            GU = L.gate_up_exps[e]' * moe_in[:, cols]  # 2n_ff × |cols|
-            act = gelu_tanh.(view(GU, 1:nf, :)) .* view(GU, (nf + 1):(2nf), :)
-            Y = (L.down_exps[e]' * act) .* L.down_exps_s[e]
-            w = reshape(Float32[p[e, t] / wsum[t] for t in cols], 1, :)
-            view(moe, :, cols) .+= Y .* w
+        wsum = [max(sum(pc[e, t] for e in sel[t]), 6.103515625f-5) for t in 1:T]
+        if T == 1
+            for e in sel[1]                            # scalar weights, no
+                GU = L.gate_up_exps[e]' * moe_in       # gather/scatter/upload
+                act = gelu_tanh.(view(GU, 1:nf, :)) .*
+                      view(GU, (nf + 1):(2nf), :)
+                moe .+= (L.down_exps[e]' * act) .*
+                        (L.down_exps_s[e] * pc[e, 1] / wsum[1])
+            end
+        else
+            for e in 1:length(L.gate_up_exps)
+                cols = [t for t in 1:T if e in sel[t]]
+                isempty(cols) && continue
+                GU = L.gate_up_exps[e]' * moe_in[:, cols]  # 2n_ff × |cols|
+                act = gelu_tanh.(view(GU, 1:nf, :)) .*
+                      view(GU, (nf + 1):(2nf), :)
+                Y = (L.down_exps[e]' * act) .* L.down_exps_s[e]
+                w = copyto!(similar(Y, 1, length(cols)),
+                    Float32[pc[e, t] / wsum[t] for t in cols])
+                moe[:, cols] = moe[:, cols] .+ Y .* w  # gather/scatter, not a
+            end                                        # view broadcast: GPU-safe
         end
         moe = norm1(moe, L.ffn_post_norm_2, m.eps)
         cur = norm1(mlp .+ moe, L.ffn_post_norm, m.eps) .+ attn_out
@@ -284,6 +339,41 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
         (logits = m.softcap .* tanh.(logits ./ m.softcap))
     return logits
 end
+
+# ---- device movement ----------------------------------------------------------
+#
+# `adapt(MtlArray, m)` moves the model to the GPU. Two fields stay host-side
+# on purpose: embd (the q6_K table is GATHERED by getindex — scalar access,
+# so it reads straight from the mmap) and down_exps_s (read as scalars during
+# expert dispatch). The tied output head IS adapted — logits are a matmul.
+
+Adapt.adapt_structure(to, L::Layer) = Layer(
+    L.is_swa, L.hd, L.nh, L.nkv,
+    Adapt.adapt(to, L.attn_norm),
+    Adapt.adapt(to, L.wq), Adapt.adapt(to, L.wk),
+    L.wv === nothing ? nothing : Adapt.adapt(to, L.wv),
+    Adapt.adapt(to, L.wo),
+    L.wq_s, L.wk_s, L.wv_s, L.wo_s,
+    Adapt.adapt(to, L.q_norm), Adapt.adapt(to, L.k_norm),
+    Adapt.adapt(to, L.attn_post_norm), L.out_scale,
+    Adapt.adapt(to, L.ffn_norm),
+    Adapt.adapt(to, L.ffn_gate), Adapt.adapt(to, L.ffn_up),
+    Adapt.adapt(to, L.ffn_down),
+    L.ffn_gate_s, L.ffn_up_s, L.ffn_down_s,
+    Adapt.adapt(to, L.ffn_post_norm), Adapt.adapt(to, L.ffn_post_norm_1),
+    Adapt.adapt(to, L.ffn_pre_norm_2), Adapt.adapt(to, L.ffn_post_norm_2),
+    Adapt.adapt(to, L.gate_inp), Adapt.adapt(to, L.gate_inp_s),
+    [Adapt.adapt(to, W) for W in L.gate_up_exps],
+    [Adapt.adapt(to, W) for W in L.down_exps],
+    L.down_exps_s)
+
+Adapt.adapt_structure(to, m::Model) = Model(
+    m.embd,
+    Adapt.adapt(to, m.output),
+    [Adapt.adapt(to, L) for L in m.layers],
+    Adapt.adapt(to, m.out_norm), Adapt.adapt(to, m.rope_factors),
+    m.n_embd, m.n_expert_used, m.eps, m.rope_global, m.rope_local,
+    m.n_swa, m.softcap)
 
 forward(m::Model, toks::Vector{<:Integer}) =
     step!(m, KVCache(m; capacity = length(toks)), collect(Int, toks))

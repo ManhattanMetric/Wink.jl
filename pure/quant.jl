@@ -18,8 +18,14 @@ module Quant
 
 using LinearAlgebra
 import KernelAbstractions
+import KernelAbstractions: @kernel, @Const, @index
+import Adapt
 
 export Q4_0Matrix, Q8_0Matrix, Q6_KMatrix
+
+# storage decides where the math runs: mmap views are CPU, device vectors GPU
+_bytes_backend(d) =
+    KernelAbstractions.get_backend(d isa SubArray ? parent(d) : d)
 
 const QK = 32
 const BLOCK = 18
@@ -59,6 +65,9 @@ function LinearAlgebra.mul!(Y::StridedVecOrMat{Float32},
         At::Adjoint{Float32, <:Q4_0Matrix}, X::StridedVecOrMat{Float32})
     A = parent(At)
     size(X, 1) == A.nrow || throw(DimensionMismatch("q4_0 mul"))
+    be = _bytes_backend(A.data)
+    be isa KernelAbstractions.CPU || return _mul_ka!(_q4_mul_kernel!, be, Y, A, X,
+        A.nrow ÷ QK)
     nb = A.nrow ÷ QK
     data = A.data
     T = size(X, 2)
@@ -110,6 +119,9 @@ function LinearAlgebra.mul!(Y::StridedVecOrMat{Float32},
         At::Adjoint{Float32, <:Q8_0Matrix}, X::StridedVecOrMat{Float32})
     A = parent(At)
     size(X, 1) == A.nrow || throw(DimensionMismatch("q8_0 mul"))
+    be = _bytes_backend(A.data)
+    be isa KernelAbstractions.CPU || return _mul_ka!(_q8_mul_kernel!, be, Y, A, X,
+        A.nrow ÷ QK)
     nb = A.nrow ÷ QK
     data = A.data
     T = size(X, 2)
@@ -178,6 +190,9 @@ function LinearAlgebra.mul!(Y::StridedVecOrMat{Float32},
         At::Adjoint{Float32, <:Q6_KMatrix}, X::StridedVecOrMat{Float32})
     A = parent(At)
     size(X, 1) == A.nrow || throw(DimensionMismatch("q6_K mul"))
+    be = _bytes_backend(A.data)
+    be isa KernelAbstractions.CPU || return _mul_ka!(_q6_mul_kernel!, be, Y, A, X,
+        A.nrow ÷ QK6)
     nsb = A.nrow ÷ QK6
     data = A.data
     T = size(X, 2)
@@ -227,6 +242,90 @@ function LinearAlgebra.mul!(Y::StridedVecOrMat{Float32},
     return Y
 end
 
+# ---- KernelAbstractions device paths ------------------------------------------
+#
+# One thread per output element (weight column × activation column); each
+# dequantizes its blocks in registers. Written once, runs on every JuliaGPU
+# backend (and the KA CPU backend, though the threaded loops above are faster
+# there, which is why mul! branches on the storage's backend).
+
+function _mul_ka!(kernel, be, Y, A, X, nblocks)
+    kernel(be)(Y, A.data, X, Int32(nblocks); ndrange = (A.ncol, size(X, 2)))
+    return Y
+end
+
+@kernel function _q4_mul_kernel!(Y, @Const(data), @Const(X), nb::Int32)
+    j, t = @index(Global, NTuple)
+    colbase = (j - 1) * Int(nb) * BLOCK
+    acc = 0.0f0
+    @inbounds for b in 0:(Int(nb) - 1)
+        off = colbase + b * BLOCK
+        s = 0.0f0
+        xoff = b * QK
+        for i in 1:16
+            q = data[off + 2 + i]
+            s = muladd(Float32(q & 0x0f) - 8.0f0, X[xoff + i, t], s)
+            s = muladd(Float32(q >> 4) - 8.0f0, X[xoff + 16 + i, t], s)
+        end
+        acc = muladd(_scale(data, off), s, acc)
+    end
+    @inbounds Y[j, t] = acc
+end
+
+@kernel function _q8_mul_kernel!(Y, @Const(data), @Const(X), nb::Int32)
+    j, t = @index(Global, NTuple)
+    colbase = (j - 1) * Int(nb) * BLOCK8
+    acc = 0.0f0
+    @inbounds for b in 0:(Int(nb) - 1)
+        off = colbase + b * BLOCK8
+        s = 0.0f0
+        xoff = b * QK
+        for i in 1:QK
+            s = muladd(Float32(reinterpret(Int8, data[off + 2 + i])),
+                X[xoff + i, t], s)
+        end
+        acc = muladd(_scale(data, off), s, acc)
+    end
+    @inbounds Y[j, t] = acc
+end
+
+@kernel function _q6_mul_kernel!(Y, @Const(data), @Const(X), nsb::Int32)
+    j, t = @index(Global, NTuple)
+    colbase = (j - 1) * Int(nsb) * BLOCK6
+    acc = 0.0f0
+    @inbounds for sb in 0:(Int(nsb) - 1)
+        off = colbase + sb * BLOCK6
+        s = 0.0f0
+        for half in 0:1
+            ql = off + half * 64
+            qh = off + 128 + half * 32
+            sc = off + 192 + half * 8
+            xb = sb * QK6 + half * 128
+            for l in 0:31
+                qlb = data[ql + l + 1]
+                qlb32 = data[ql + 32 + l + 1]
+                qhb = data[qh + l + 1]
+                is = l >> 4
+                q1 = Float32((qlb & 0x0f) | ((qhb & 0x03) << 4)) - 32.0f0
+                q2 = Float32((qlb32 & 0x0f) |
+                             (((qhb >> 2) & 0x03) << 4)) - 32.0f0
+                q3 = Float32((qlb >> 4) | (((qhb >> 4) & 0x03) << 4)) - 32.0f0
+                q4 = Float32((qlb32 >> 4) | ((qhb >> 6) << 4)) - 32.0f0
+                s = muladd(Float32(reinterpret(Int8, data[sc + is + 1])) * q1,
+                    X[xb + l + 1, t], s)
+                s = muladd(Float32(reinterpret(Int8, data[sc + is + 3])) * q2,
+                    X[xb + 32 + l + 1, t], s)
+                s = muladd(Float32(reinterpret(Int8, data[sc + is + 5])) * q3,
+                    X[xb + 64 + l + 1, t], s)
+                s = muladd(Float32(reinterpret(Int8, data[sc + is + 7])) * q4,
+                    X[xb + 96 + l + 1, t], s)
+            end
+        end
+        acc = muladd(_scale(data, off + 208), s, acc)
+    end
+    @inbounds Y[j, t] = acc
+end
+
 # ---- shared interface ---------------------------------------------------------
 
 const AnyQuant = Union{Q4_0Matrix, Q8_0Matrix, Q6_KMatrix}
@@ -234,8 +333,16 @@ const AnyQuant = Union{Q4_0Matrix, Q8_0Matrix, Q6_KMatrix}
 # activations and caches allocated "like" quantized weights are plain arrays
 Base.similar(A::AnyQuant, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
 
-# quantized weights live in host memory; their GPU story is a
-# KernelAbstractions dequant-matmul kernel, not device residency of this type
-KernelAbstractions.get_backend(::AnyQuant) = KernelAbstractions.CPU()
+KernelAbstractions.get_backend(A::AnyQuant) = _bytes_backend(A.data)
+
+# device movement: MATERIALIZE the bytes before adapting — adapting an mmap
+# view directly would rebuild the view over an adapted parent, i.e. upload
+# the entire multi-GB file once per tensor
+Adapt.adapt_structure(to, A::Q4_0Matrix) =
+    Q4_0Matrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
+Adapt.adapt_structure(to, A::Q8_0Matrix) =
+    Q8_0Matrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
+Adapt.adapt_structure(to, A::Q6_KMatrix) =
+    Q6_KMatrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
 
 end # module Quant
