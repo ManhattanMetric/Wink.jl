@@ -69,7 +69,7 @@ struct Layer
     gate_inp_s::AbstractVector{Float32}
     gate_up_exps::Q4_0Stack           # [n_embd, 2n_ff] × n_expert, one buffer
     down_exps::Q4_0Stack              # [n_ff, n_embd] × n_expert, one buffer
-    down_exps_s::Vector{Float32}
+    down_exps_s::AbstractVector{Float32}
 end
 
 struct Model
@@ -160,23 +160,44 @@ end
 
 # ---- building blocks ----------------------------------------------------------
 
-function norm1(X::AbstractArray, w::AbstractVector, eps)
-    ms = sum(abs2, X; dims = 1) ./ Float32(size(X, 1))
-    return (X .* w) ./ sqrt.(ms .+ eps)
+# In-place building blocks: on Metal, every allocation is a ~1.4ms
+# pipeline stall (fresh device buffers until GC), so the forward pass runs
+# entirely in named arena buffers (see buf!) and these helpers write into
+# their destination. Y === X is safe: the reduction runs first and the
+# apply step is element-aligned.
+
+function norm1!(Y, ms, X, w, eps)
+    fill!(ms, 0.0f0)
+    Base.mapreducedim!(abs2, +, ms, X)
+    Y .= (X .* w) ./ sqrt.(ms ./ Float32(size(X, 1)) .+ eps)
+    return Y
 end
 
 # weightless RMS-norm (gemma-4 uses it on V and on the router input)
-function norm0(X::AbstractArray, eps)
-    ms = sum(abs2, X; dims = 1) ./ Float32(size(X, 1))
-    return X ./ sqrt.(ms .+ eps)
+function norm0!(Y, ms, X, eps)
+    fill!(ms, 0.0f0)
+    Base.mapreducedim!(abs2, +, ms, X)
+    Y .= X ./ sqrt.(ms ./ Float32(size(X, 1)) .+ eps)
+    return Y
+end
+
+function softmax!(S, mx, ssum)
+    fill!(mx, -Inf32)
+    Base.mapreducedim!(identity, max, mx, S)
+    S .= exp.(S .- mx)
+    fill!(ssum, 0.0f0)
+    Base.mapreducedim!(identity, +, ssum, S)
+    S ./= ssum
+    return S
 end
 
 gelu_tanh(x) = 0.5f0 * x * (1 + tanh(0.7978845608028654f0 * (x + 0.044715f0 * x^3)))
 
 @kernel function _rope_kernel!(X, base::Float32, pos0::Int32, half::Int32,
-        factors)
+        factors, hasfac::Int32)
     i, h, t = @index(Global, NTuple)
-    θ = Float32(pos0 + t - 1) * base^(-2.0f0 * (i - 1) / (2.0f0 * half)) / factors[i]
+    fac = hasfac != 0 ? factors[i] : 1.0f0
+    θ = Float32(pos0 + t - 1) * base^(-2.0f0 * (i - 1) / (2.0f0 * half)) / fac
     c, s = cos(θ), sin(θ)
     x1 = X[i, h, t]
     x2 = X[i + half, h, t]
@@ -187,10 +208,8 @@ end
 function rope!(X::AbstractArray{Float32, 3}, base::Float32, factors;
         pos0::Int = 0)
     half = size(X, 1) ÷ 2
-    fac = length(factors) == half ? factors :
-        fill!(KernelAbstractions.allocate(get_backend(X), Float32, half), 1.0f0)
-    _rope_kernel!(get_backend(X))(X, base, Int32(pos0), Int32(half), fac;
-        ndrange = (half, size(X, 2), size(X, 3)))
+    _rope_kernel!(get_backend(X))(X, base, Int32(pos0), Int32(half), factors,
+        Int32(length(factors) == half); ndrange = (half, size(X, 2), size(X, 3)))
     return X
 end
 
@@ -214,6 +233,27 @@ end
     end
 end
 
+# in-place column softmax over dim 1 — one launch, view-friendly (the
+# mapreducedim! path collapses on strided views of the padded S buffer)
+@kernel function _softmax_dim1!(S)
+    hh, t = @index(Global, NTuple)
+    n = size(S, 1)
+    mx = -Inf32
+    @inbounds for i in 1:n
+        mx = max(mx, S[i, hh, t])
+    end
+    ssum = 0.0f0
+    @inbounds for i in 1:n
+        e = exp(S[i, hh, t] - mx)
+        S[i, hh, t] = e
+        ssum += e
+    end
+    inv = 1.0f0 / ssum
+    @inbounds for i in 1:n
+        S[i, hh, t] *= inv
+    end
+end
+
 @kernel function _attn_out!(att, @Const(V), @Const(S), hpk::Int32, hd::Int32)
     d, hh, t = @index(Global, NTuple)
     kv = (hh - 1) ÷ Int(hpk) + 1
@@ -222,6 +262,49 @@ end
         s = muladd(V[d, kv, pos], S[pos, hh, t], s)
     end
     @inbounds att[(hh - 1) * Int(hd) + d, t] = s
+end
+
+# Each token's top-K experts, selected and weighted ON the device — the
+# host round-trip per layer was what kept Metal's command batching from
+# ever forming a batch. Serial repeated-max over n_expert probs per token;
+# the down-projection's QAT scale folds into the weight here.
+@kernel function _router_topk!(sel, w, @Const(p), @Const(down_s), K::Int32,
+        clampmin::Float32)
+    t = @index(Global)
+    wsum = 0.0f0
+    @inbounds for k in 1:Int(K)
+        best = -Inf32
+        bi = 1
+        for e in 1:size(p, 1)
+            v = p[e, t]
+            taken = false
+            for kk in 1:(k - 1)
+                taken |= Int(sel[kk, t]) == e
+            end
+            if !taken && v > best
+                best = v
+                bi = e
+            end
+        end
+        sel[k, t] = Int32(bi)
+        w[k, t] = best
+        wsum += best
+    end
+    wsum = max(wsum, clampmin)
+    @inbounds for k in 1:Int(K)
+        w[k, t] = w[k, t] / wsum * down_s[Int(sel[k, t])]
+    end
+end
+
+# small dense f32 matvec as a kernel: the router matmul must not route to
+# MPS, whose separate command buffer would flush the batch every layer
+@kernel function _dense_matvec!(Y, @Const(W), @Const(X))
+    j, t = @index(Global, NTuple)
+    s = 0.0f0
+    @inbounds for i in 1:size(W, 1)
+        s = muladd(W[i, j], X[i, t], s)
+    end
+    @inbounds Y[j, t] = s
 end
 
 # The fused MoE: kernel A computes gated activations for every
@@ -261,12 +344,21 @@ mutable struct KVCache{A <: AbstractArray{Float32, 3}}
     V::Vector{A}
     n::Int
     capacity::Int
+    scratch::Dict{Any, Any}   # named reusable buffers — see buf!
 end
 
 KVCache(m::Model; capacity::Int = 4096) = KVCache(
     [fill!(similar(L.attn_norm, L.hd, L.nkv, capacity), 0.0f0) for L in m.layers],
     [fill!(similar(L.attn_norm, L.hd, L.nkv, capacity), 0.0f0) for L in m.layers],
-    0, capacity)
+    0, capacity, Dict{Any, Any}())
+
+# the arena: step! intermediates keyed by use-site name + dims, allocated
+# once and reused every token (per-layer geometry differences key apart
+# naturally; dynamic lookup costs ~100ns against ~ms device allocations)
+@inline buf!(c::KVCache, ref, name::Symbol, dims::Int...) =
+    get!(() -> similar(ref, Float32, dims), c.scratch, (name, dims...))
+@inline tbuf!(c::KVCache, ref, ::Type{T}, name::Symbol, dims::Int...) where {T} =
+    get!(() -> similar(ref, T, dims), c.scratch, (name, dims...))
 
 # ---- the forward pass ---------------------------------------------------------
 
@@ -276,34 +368,53 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
     P + T <= c.capacity ||
         error("KV cache full ($(c.capacity)); allocate a larger KVCache")
     inv_sqrt_embd = 1.0f0 / sqrt(Float32(m.n_embd))
-    h0 = m.embd[:, collect(Int, toks) .+ 1] .* sqrt(Float32(m.n_embd))
-    h = copyto!(similar(c.K[1], m.n_embd, T), h0)
+    ne = m.n_embd
+    h = buf!(c, c.K[1], :h, ne, T)
+    copyto!(h, m.embd[:, collect(Int, toks) .+ 1] .* sqrt(Float32(ne)))
+    ongpu = !(get_backend(h) isa KernelAbstractions.CPU)
     kq = reshape(0:(P + T - 1), :, 1)
     qq = reshape(P:(P + T - 1), 1, :)
+    msn = buf!(c, h, :msn, 1, T)          # shared column-norm scratch
     for (il, L) in enumerate(m.layers)
         base = L.is_swa ? m.rope_local : m.rope_global
-        factors = L.is_swa ? Float32[] : m.rope_factors
         hd, nh, nkv = L.hd, L.nh, L.nkv
-        xn = norm1(h, L.attn_norm, m.eps)
-        q = rope!(norm1(reshape((L.wq' * xn) .* L.wq_s, hd, nh, T),
-                L.q_norm, m.eps), base, factors; pos0 = P)
-        k = rope!(norm1(reshape((L.wk' * xn) .* L.wk_s, hd, nkv, T),
-                L.k_norm, m.eps), base, factors; pos0 = P)
-        vsrc = L.wv === nothing ? (L.wk' * xn) .* L.wk_s :
-                                  (L.wv' * xn) .* L.wv_s
-        v = norm0(reshape(vsrc, hd, nkv, T), m.eps)
-        c.K[il][:, :, (P + 1):(P + T)] = k
-        c.V[il][:, :, (P + 1):(P + T)] = v
-        att = similar(h, hd * nh, T)
-        ongpu = !(get_backend(h) isa KernelAbstractions.CPU)
+        facs = L.is_swa ? view(m.rope_factors, 1:0) : m.rope_factors
+        xn = norm1!(buf!(c, h, :xn, ne, T), msn, h, L.attn_norm, m.eps)
+        q2 = mul!(buf!(c, h, :q, hd * nh, T), L.wq', xn)
+        q2 .*= L.wq_s
+        q = reshape(q2, hd, nh, T)
+        msq = buf!(c, h, :msq, 1, nh, T)
+        norm1!(q, msq, q, L.q_norm, m.eps)
+        rope!(q, base, facs; pos0 = P)
+        k2 = mul!(buf!(c, h, :k, hd * nkv, T), L.wk', xn)
+        k2 .*= L.wk_s
+        k3 = reshape(k2, hd, nkv, T)
+        msk = buf!(c, h, :msk, 1, nkv, T)
+        norm1!(k3, msk, k3, L.k_norm, m.eps)
+        rope!(k3, base, facs; pos0 = P)
+        v2 = mul!(buf!(c, h, :v, hd * nkv, T),
+            (L.wv === nothing ? L.wk : L.wv)', xn)
+        v2 .*= L.wv === nothing ? L.wk_s : L.wv_s
+        v3 = reshape(v2, hd, nkv, T)
+        norm0!(v3, msk, v3, m.eps)
+        c.K[il][:, :, (P + 1):(P + T)] = k3
+        c.V[il][:, :, (P + 1):(P + T)] = v3
+        att = buf!(c, h, :att, hd * nh, T)
         if T == 1 || ongpu
             Kp = P + T
-            S = similar(h, Kp, nh, T)
-            _attn_scores!(get_backend(S))(S, c.K[il], q, Int32(nh ÷ nkv),
+            # generation: padded buffer + view so the key is stable across
+            # tokens; prefill: exact contiguous buffer (new dims only once
+            # per chunk — reductions and kernels prefer contiguous)
+            S = if T == 1
+                Kpad = min(cld(Kp, 512) * 512, c.capacity)
+                view(buf!(c, h, :S, Kpad, nh, T), 1:Kp, :, :)
+            else
+                buf!(c, h, :S, Kp, nh, T)
+            end
+            _attn_scores!(get_backend(h))(S, c.K[il], q, Int32(nh ÷ nkv),
                 Int32(P), Int32(L.is_swa ? m.n_swa : 0); ndrange = (Kp, nh, T))
-            S = exp.(S .- maximum(S; dims = 1))
-            S ./= sum(S; dims = 1)
-            _attn_out!(get_backend(att))(att, c.V[il], S, Int32(nh ÷ nkv),
+            _softmax_dim1!(get_backend(h))(S; ndrange = (nh, T))
+            _attn_out!(get_backend(h))(att, c.V[il], S, Int32(nh ÷ nkv),
                 Int32(hd); ndrange = (hd, nh, T))
         else
             for hh in 1:nh
@@ -319,71 +430,95 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
                 att[(1 + (hh - 1) * hd):(hh * hd), :] = Vc * S
             end
         end
-        attno = (L.wo' * att) .* L.wo_s
-        attn_out = norm1(attno, L.attn_post_norm, m.eps) .+ h
+        attno = mul!(buf!(c, h, :attno, ne, T), L.wo', att)
+        attno .*= L.wo_s
+        attn_out = norm1!(buf!(c, h, :attn_out, ne, T), msn, attno,
+            L.attn_post_norm, m.eps)
+        attn_out .+= h
         # dense (shared-expert) branch
-        mlpn = norm1(attn_out, L.ffn_norm, m.eps)
-        mlp = (L.ffn_down' * (gelu_tanh.((L.ffn_gate' * mlpn) .* L.ffn_gate_s) .*
-                              ((L.ffn_up' * mlpn) .* L.ffn_up_s))) .* L.ffn_down_s
-        mlp = norm1(mlp, L.ffn_post_norm_1, m.eps)
+        mlpn = norm1!(buf!(c, h, :mlpn, ne, T), msn, attn_out, L.ffn_norm, m.eps)
+        nfd = size(L.ffn_gate, 2)
+        g = mul!(buf!(c, h, :ffg, nfd, T), L.ffn_gate', mlpn)
+        u = mul!(buf!(c, h, :ffu, nfd, T), L.ffn_up', mlpn)
+        g .= gelu_tanh.(g .* L.ffn_gate_s) .* (u .* L.ffn_up_s)
+        mlp = mul!(buf!(c, h, :mlp, ne, T), L.ffn_down', g)
+        mlp .*= L.ffn_down_s
+        norm1!(mlp, msn, mlp, L.ffn_post_norm_1, m.eps)
         # router (its own view of the residual stream)
-        tmp = (norm0(attn_out, m.eps) .* inv_sqrt_embd) .* L.gate_inp_s
-        rlog = L.gate_inp' * tmp                       # n_expert × T
-        p = exp.(rlog .- maximum(rlog; dims = 1))
-        p ./= sum(p; dims = 1)
-        pc = Array(p)                                  # routing is host-side
+        tmp = norm0!(buf!(c, h, :rt, ne, T), msn, attn_out, m.eps)
+        tmp .= tmp .* inv_sqrt_embd .* L.gate_inp_s
+        nex = size(L.gate_inp, 2)
+        p = buf!(c, h, :p, nex, T)
+        if ongpu && T == 1
+            # T=1: MPS would flush the command batch every layer; a serial
+            # matvec kernel batches. Prefill amortizes the flush, and MPS
+            # GEMM wins decisively at large T.
+            _dense_matvec!(get_backend(h))(p, L.gate_inp, tmp;
+                ndrange = (nex, T))
+        else
+            mul!(p, L.gate_inp', tmp)
+        end
+        softmax!(p, buf!(c, h, :mxp, 1, T), buf!(c, h, :smp, 1, T))
         # expert branch
-        moe_in = norm1(attn_out, L.ffn_pre_norm_2, m.eps)
-        moe = fill!(similar(attn_out), 0.0f0)
-        nf = size(L.down_exps[1], 1)
-        sel = [partialsortperm(view(pc, :, t), 1:m.n_expert_used; rev = true)
-               for t in 1:T]
-        wsum = [max(sum(pc[e, t] for e in sel[t]), 6.103515625f-5) for t in 1:T]
+        moe_in = norm1!(buf!(c, h, :moein, ne, T), msn, attn_out,
+            L.ffn_pre_norm_2, m.eps)
+        moe = buf!(c, h, :moe, ne, T)
+        nf = L.down_exps.nrow
+        K = m.n_expert_used
         if ongpu
-            K = m.n_expert_used
             gu, dn = L.gate_up_exps, L.down_exps
-            seld = copyto!(similar(h, Int32, K, T),
-                Int32[sel[t][k] for k in 1:K, t in 1:T])
-            wd = copyto!(similar(h, K, T),
-                Float32[pc[sel[t][k], t] / wsum[t] * L.down_exps_s[sel[t][k]]
-                        for k in 1:K, t in 1:T])
-            act = similar(h, nf, K * T)
+            seld = tbuf!(c, h, Int32, :seld, K, T)
+            wd = buf!(c, h, :wd, K, T)
+            _router_topk!(get_backend(h))(seld, wd, p, L.down_exps_s,
+                Int32(K), 6.103515625f-5; ndrange = T)
+            act = buf!(c, h, :moeact, nf, K * T)
             _moe_act!(get_backend(h))(act, gu.data, seld, moe_in,
                 Int32(gu.nrow ÷ 32), Int32(nf), Int32(K), perexp(gu);
                 ndrange = (nf, K * T))
             _moe_down!(get_backend(h))(moe, dn.data, seld, wd, act,
                 Int32(dn.nrow ÷ 32), Int32(K), perexp(dn);
-                ndrange = (m.n_embd, T))
-        elseif T == 1
-            for e in sel[1]                            # scalar weights, no
-                GU = L.gate_up_exps[e]' * moe_in       # gather/scatter/upload
-                act = gelu_tanh.(view(GU, 1:nf, :)) .*
-                      view(GU, (nf + 1):(2nf), :)
-                moe .+= (L.down_exps[e]' * act) .*
-                        (L.down_exps_s[e] * pc[e, 1] / wsum[1])
-            end
+                ndrange = (ne, T))
         else
-            for e in 1:length(L.gate_up_exps)
-                cols = [t for t in 1:T if e in sel[t]]
-                isempty(cols) && continue
-                GU = L.gate_up_exps[e]' * moe_in[:, cols]  # 2n_ff × |cols|
-                act = gelu_tanh.(view(GU, 1:nf, :)) .*
-                      view(GU, (nf + 1):(2nf), :)
-                Y = (L.down_exps[e]' * act) .* L.down_exps_s[e]
-                w = copyto!(similar(Y, 1, length(cols)),
-                    Float32[pc[e, t] / wsum[t] for t in cols])
-                moe[:, cols] = moe[:, cols] .+ Y .* w  # gather/scatter, not a
-            end                                        # view broadcast: GPU-safe
+            fill!(moe, 0.0f0)
+            pc = Array(p)
+            sel = [partialsortperm(view(pc, :, t), 1:K; rev = true)
+                   for t in 1:T]
+            wsum = [max(sum(pc[e, t] for e in sel[t]), 6.103515625f-5)
+                    for t in 1:T]
+            if T == 1
+                for e in sel[1]                        # scalar weights, no
+                    GU = mul!(buf!(c, h, :GU, 2nf, 1), # gather/scatter
+                        L.gate_up_exps[e]', moe_in)
+                    ga = view(GU, 1:nf, :)
+                    ga .= gelu_tanh.(ga) .* view(GU, (nf + 1):(2nf), :)
+                    Ye = mul!(buf!(c, h, :expY, ne, 1), L.down_exps[e]', ga)
+                    moe .+= Ye .* (L.down_exps_s[e] * pc[e, 1] / wsum[1])
+                end
+            else
+                for e in 1:length(L.gate_up_exps)
+                    cols = [t for t in 1:T if e in sel[t]]
+                    isempty(cols) && continue
+                    GU = L.gate_up_exps[e]' * moe_in[:, cols]
+                    ga = gelu_tanh.(view(GU, 1:nf, :)) .*
+                         view(GU, (nf + 1):(2nf), :)
+                    Y = (L.down_exps[e]' * ga) .* L.down_exps_s[e]
+                    w = copyto!(similar(Y, 1, length(cols)),
+                        Float32[pc[e, t] / wsum[t] for t in cols])
+                    moe[:, cols] = moe[:, cols] .+ Y .* w
+                end
+            end
         end
-        moe = norm1(moe, L.ffn_post_norm_2, m.eps)
-        cur = norm1(mlp .+ moe, L.ffn_post_norm, m.eps) .+ attn_out
-        h = cur .* L.out_scale
+        norm1!(moe, msn, moe, L.ffn_post_norm_2, m.eps)
+        mlp .+= moe
+        norm1!(mlp, msn, mlp, L.ffn_post_norm, m.eps)
+        h .= (mlp .+ attn_out) .* L.out_scale
     end
     c.n += T
-    logits = m.output' * norm1(h, m.out_norm, m.eps)
+    xnf = norm1!(buf!(c, h, :xnf, ne, T), msn, h, m.out_norm, m.eps)
+    logits = mul!(buf!(c, h, :logits, size(m.output, 2), T), m.output', xnf)
     m.softcap > 0 &&
-        (logits = m.softcap .* tanh.(logits ./ m.softcap))
-    return logits
+        (logits .= m.softcap .* tanh.(logits ./ m.softcap))
+    return logits    # valid until the next step! on this cache
 end
 
 # ---- device movement ----------------------------------------------------------
@@ -410,7 +545,7 @@ Adapt.adapt_structure(to, L::Layer) = Layer(
     Adapt.adapt(to, L.ffn_pre_norm_2), Adapt.adapt(to, L.ffn_post_norm_2),
     Adapt.adapt(to, L.gate_inp), Adapt.adapt(to, L.gate_inp_s),
     Adapt.adapt(to, L.gate_up_exps), Adapt.adapt(to, L.down_exps),
-    L.down_exps_s)
+    Adapt.adapt(to, L.down_exps_s))
 
 Adapt.adapt_structure(to, m::Model) = Model(
     m.embd,
