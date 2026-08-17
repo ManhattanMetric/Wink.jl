@@ -37,10 +37,16 @@
     schemas = [Wink._tool_schema(t) for t in tools]
     @test any(s -> s["function"]["name"] == "eval_code", schemas)
     @test all(s -> haskey(s["function"], "parameters"), schemas)
-    g = Wink.tool_call_grammar(schemas)
-    @test occursin("tool-eval-code ::=", g)
-    @test occursin("tool-get-doc ::= \"get_doc{\" \"name:\" string \"}\"", g)
-    @test occursin("root ::= \"<|tool_call>call:\"", g)
+    ms = Wink.compile_matchers(schemas)
+    @test length(ms) == length(schemas)
+    Q = "<|\"|>"
+    good = Vector{UInt8}(codeunits("call:get_doc{name:" * Q * "sort" * Q * "}<tool_call|>"))
+    @test Wink.call_state(ms, good) === :complete
+    @test Wink.call_state(ms, good[1:9]) === :prefix
+    @test Wink.call_state(ms, Vector{UInt8}(codeunits("call:not_a_tool{"))) === :invalid
+    # a constrained region cannot hold an unquoted string argument
+    @test Wink.call_state(ms,
+        Vector{UInt8}(codeunits("call:get_doc{name:sort"))) === :invalid
 
     # a native tool exchange renders through the Gemma-4 family and the
     # emitted call parses back to the same name and args
@@ -91,9 +97,6 @@ end
     # text-only: tools are refused, not degraded
     @test_throws Exception Wink.render_chat(g3, msgs;
         tools = [Dict("function" => Dict("name" => "f"))])
-
-    # pure backend inactive by default; routing untouched
-    @test Wink.PURE_MODEL[] === nothing
 end
 
 @testset "local budget coordination" begin
@@ -114,17 +117,4 @@ end
     finally
         Wink.CONFIG.context_budget = old_budget
     end
-
-    # the wall pre-check produces an actionable error, not a C-level one
-    lm_like = (; n_ctx = 1_024, )
-    @test Wink._room_check((; n_ctx = 16_384), 9_000) === nothing
-    err = try
-        Wink._room_check(lm_like, 9_000)
-        nothing
-    catch e
-        sprint(showerror, e)
-    end
-    @test occursin("context window full", err)
-    @test occursin(":compact", err)
-    @test occursin("n_ctx", err)
 end

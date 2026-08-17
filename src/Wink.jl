@@ -39,26 +39,22 @@ include("evalengine.jl")
 include("shell.jl")
 include("edit.jl")
 include("rag.jl")
-include("pure/quant.jl")
-include("pure/gguf.jl")
-include("pure/tokenizer.jl")
-include("pure/bpe.jl")
-include("pure/gemma3.jl")
-include("pure/gemma4.jl")
-include("pure/olmoe.jl")
-include("llamacpp/LibLlama.jl")
-const L = LibLlama
-include("llamacpp/render.jl")
-include("llamacpp/grammar.jl")
-include("llamacpp/backend.jl")
-include("pure/constrain.jl")
-include("pure/backend.jl")
+include("quant.jl")
+include("gguf.jl")
+include("tokenizer.jl")
+include("bpe.jl")
+include("gemma3.jl")
+include("gemma4.jl")
+include("olmoe.jl")
+include("render.jl")
+include("constrain.jl")
+include("local.jl")
 include("agent.jl")
 include("compact.jl")
 include("repl.jl")
 
 export configure!, autoeval!, ask, reset!, compact!, reindex!, index_packages!,
-       local_model!, local_embed_model!
+       local_model!
 
 function __init__()
     # CONFIG is constructed during precompilation, so its status_io field holds

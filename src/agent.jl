@@ -339,11 +339,7 @@ end
 
 function _aitools_call(schema, history, tools)
     # An in-process model, when loaded, takes the default route; explicit
-    # schemas (tests, overrides) still go through PromptingTools. The
-    # pure-Julia backend is the default local path; llama.cpp is
-    # pre-deprecated and checked second.
-    schema === nothing && PURE_MODEL[] !== nothing &&
-        return _pure_aitools(PURE_MODEL[]::PureModel, history, tools)
+    # schemas (tests, overrides) still go through PromptingTools.
     schema === nothing && LOCAL_MODEL[] !== nothing &&
         return _local_aitools(LOCAL_MODEL[]::LocalModel, history, tools)
     sch = schema === nothing ? _model_schema(CONFIG.chat_model) : schema

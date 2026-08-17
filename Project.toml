@@ -5,7 +5,6 @@ version = "0.1.0-DEV"
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-CEnum = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 CodeTracking = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
 Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 IOCapture = "b5f81e59-6552-4d32-b1f0-c071b021bf89"
@@ -26,7 +25,6 @@ Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 
 [compat]
 Adapt = "4"
-CEnum = "0.4, 0.5"
 CodeTracking = "3"
 Downloads = "1"
 IOCapture = "1"
