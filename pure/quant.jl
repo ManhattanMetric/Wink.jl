@@ -21,7 +21,7 @@ import KernelAbstractions
 import KernelAbstractions: @kernel, @Const, @index
 import Adapt
 
-export Q4_0Matrix, Q8_0Matrix, Q6_KMatrix
+export Q4_0Matrix, Q8_0Matrix, Q6_KMatrix, Q4_0Stack
 
 # storage decides where the math runs: mmap views are CPU, device vectors GPU
 _bytes_backend(d) =
@@ -254,12 +254,13 @@ function _mul_ka!(kernel, be, Y, A, X, nblocks)
     return Y
 end
 
-@kernel function _q4_mul_kernel!(Y, @Const(data), @Const(X), nb::Int32)
-    j, t = @index(Global, NTuple)
-    colbase = (j - 1) * Int(nb) * BLOCK
+# device-safe dot of one q4_0 column (at byte offset off0) with X[:, t] —
+# the building block for both the generic matmul kernel and callers that
+# address columns inside a larger buffer (e.g. fused MoE expert stacks)
+@inline function q4_dot(data, off0::Int, X, t::Int, nb::Int)
     acc = 0.0f0
-    @inbounds for b in 0:(Int(nb) - 1)
-        off = colbase + b * BLOCK
+    @inbounds for b in 0:(nb - 1)
+        off = off0 + b * BLOCK
         s = 0.0f0
         xoff = b * QK
         for i in 1:16
@@ -269,7 +270,12 @@ end
         end
         acc = muladd(_scale(data, off), s, acc)
     end
-    @inbounds Y[j, t] = acc
+    return acc
+end
+
+@kernel function _q4_mul_kernel!(Y, @Const(data), @Const(X), nb::Int32)
+    j, t = @index(Global, NTuple)
+    @inbounds Y[j, t] = q4_dot(data, (j - 1) * Int(nb) * BLOCK, X, t, Int(nb))
 end
 
 @kernel function _q8_mul_kernel!(Y, @Const(data), @Const(X), nb::Int32)
@@ -344,5 +350,27 @@ Adapt.adapt_structure(to, A::Q8_0Matrix) =
     Q8_0Matrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
 Adapt.adapt_structure(to, A::Q6_KMatrix) =
     Q6_KMatrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
+
+# ---- expert stacks ------------------------------------------------------------
+#
+# A 3-D q4_0 tensor (n_expert weight matrices) kept as ONE buffer, so a
+# fused-MoE kernel can address any expert by byte stride, and so device
+# movement is one upload per stack instead of n_expert. Indexing yields a
+# zero-copy Q4_0Matrix view of one expert for the loop-based (CPU) paths.
+
+struct Q4_0Stack{D <: AbstractVector{UInt8}}
+    data::D
+    nrow::Int
+    ncol::Int
+    nexp::Int
+end
+
+perexp(A::Q4_0Stack) = (A.nrow ÷ QK) * BLOCK * A.ncol
+Base.length(A::Q4_0Stack) = A.nexp
+Base.getindex(A::Q4_0Stack, e::Integer) = Q4_0Matrix(
+    view(A.data, ((e - 1) * perexp(A) + 1):(e * perexp(A))), A.nrow, A.ncol)
+
+Adapt.adapt_structure(to, A::Q4_0Stack) =
+    Q4_0Stack(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol, A.nexp)
 
 end # module Quant

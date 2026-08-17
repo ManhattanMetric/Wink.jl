@@ -32,7 +32,7 @@ using KernelAbstractions
 import Adapt
 
 using ..GGUF: GGUFFile, tensor, metadata, raw_tensor
-using ..Quant: Q4_0Matrix
+using ..Quant: Q4_0Matrix, Q4_0Stack, q4_dot, perexp
 
 export load_model, forward, generate, KVCache, step!
 
@@ -67,8 +67,8 @@ struct Layer
     ffn_post_norm_2::AbstractVector{Float32}
     gate_inp::AbstractMatrix{Float32}
     gate_inp_s::AbstractVector{Float32}
-    gate_up_exps::Vector{<:AbstractMatrix{Float32}}   # per-expert [n_embd, 2n_ff]
-    down_exps::Vector{<:AbstractMatrix{Float32}}      # per-expert [n_ff, n_embd]
+    gate_up_exps::Q4_0Stack           # [n_embd, 2n_ff] × n_expert, one buffer
+    down_exps::Q4_0Stack              # [n_ff, n_embd] × n_expert, one buffer
     down_exps_s::Vector{Float32}
 end
 
@@ -90,14 +90,11 @@ end
 _scalar(f, name, default = 1.0f0) =
     haskey(f.tensors, name) ? Float32(tensor(f, name)[1]) : default
 
-# per-expert quantized slabs as zero-copy views of a 3-D q4_0 tensor
-function _expert_slabs(f::GGUFFile, name::AbstractString)
+# an expert stack as a zero-copy view of the whole 3-D q4_0 tensor
+function _expert_stack(f::GGUFFile, name::AbstractString)
     bytes, dims, typ = raw_tensor(f, name)
     typ == 2 || error("$name: expected q4_0 experts, got ggml type $typ")
-    nrow, ncol, ne = dims
-    per = (nrow ÷ 32) * 18 * ncol
-    return [Q4_0Matrix(view(bytes, ((e - 1) * per + 1):(e * per)), nrow, ncol)
-            for e in 1:ne]
+    return Q4_0Stack(bytes, dims[1], dims[2], dims[3])
 end
 
 function load_model(f::GGUFFile)
@@ -138,11 +135,11 @@ function load_model(f::GGUFFile)
             vec(tensor(f, p * "post_ffw_norm_2.weight")),
             Matrix{Float32}(tensor(f, p * "ffn_gate_inp.weight")),
             vec(tensor(f, p * "ffn_gate_inp.scale")),
-            _expert_slabs(f, p * "ffn_gate_up_exps.weight"),
-            _expert_slabs(f, p * "ffn_down_exps.weight"),
+            _expert_stack(f, p * "ffn_gate_up_exps.weight"),
+            _expert_stack(f, p * "ffn_down_exps.weight"),
             haskey(f.tensors, p * "ffn_down_exps.scale") ?
                 vec(tensor(f, p * "ffn_down_exps.scale")) :
-                ones(Float32, length(_expert_slabs(f, p * "ffn_down_exps.weight"))))
+                ones(Float32, Int(metadata(f, "gemma4.expert_count"))))
     end
     embd = tensor(f, "token_embd.weight")
     return Model(embd,
@@ -197,32 +194,66 @@ function rope!(X::AbstractArray{Float32, 3}, base::Float32, factors;
     return X
 end
 
-# Single-token attention as two fused kernels (one launch each) instead of a
-# per-head loop of small matmuls — at 48 layers the launch count is what
-# throttles the GPU, not the math. Scores mask the sliding window in-kernel.
-@kernel function _attn1_scores!(S, @Const(K), @Const(q), hpk::Int32,
-        wstart::Int32)
-    pos, hh = @index(Global, NTuple)
-    if pos < Int(wstart)
-        @inbounds S[pos, hh] = -Inf32
-    else
+# Attention as two fused kernels (one launch each, any batch size) instead
+# of a per-head loop of small matmuls — at 48 layers the launch count is
+# what throttles the GPU, not the math. The causal + sliding-window mask is
+# decided in-kernel (nswa <= 0 means global).
+@kernel function _attn_scores!(S, @Const(K), @Const(q), hpk::Int32, P::Int32,
+        nswa::Int32)
+    pos, hh, t = @index(Global, NTuple)
+    qpos = Int(P) + t
+    if pos <= qpos && (Int(nswa) <= 0 || qpos - pos < Int(nswa))
         kv = (hh - 1) ÷ Int(hpk) + 1
         s = 0.0f0
         @inbounds for d in 1:size(K, 1)
-            s = muladd(K[d, kv, pos], q[d, hh], s)
+            s = muladd(K[d, kv, pos], q[d, hh, t], s)
         end
-        @inbounds S[pos, hh] = s
+        @inbounds S[pos, hh, t] = s
+    else
+        @inbounds S[pos, hh, t] = -Inf32
     end
 end
 
-@kernel function _attn1_out!(att, @Const(V), @Const(S), hpk::Int32, hd::Int32)
-    d, hh = @index(Global, NTuple)
+@kernel function _attn_out!(att, @Const(V), @Const(S), hpk::Int32, hd::Int32)
+    d, hh, t = @index(Global, NTuple)
     kv = (hh - 1) ÷ Int(hpk) + 1
     s = 0.0f0
     @inbounds for pos in 1:size(S, 1)
-        s = muladd(V[d, kv, pos], S[pos, hh], s)
+        s = muladd(V[d, kv, pos], S[pos, hh, t], s)
     end
-    @inbounds att[(hh - 1) * Int(hd) + d, 1] = s
+    @inbounds att[(hh - 1) * Int(hd) + d, t] = s
+end
+
+# The fused MoE: kernel A computes gated activations for every
+# (expert, token) pair, kernel B has each (channel, token) thread sum its
+# own n_used experts — 2 launches per layer at ANY batch size, where the
+# per-expert loop needed ~6 launches (plus an upload) per ACTIVE expert.
+# Expert weights are addressed by byte stride inside the layer's single
+# stack buffer; the top-8 routing weights (with the down-projection's QAT
+# scale folded in) arrive as one small upload.
+@kernel function _moe_act!(act, @Const(data), @Const(sel), @Const(X),
+        nb::Int32, nf::Int32, K::Int32, per::Int)
+    i, kt = @index(Global, NTuple)
+    k = (kt - 1) % Int(K) + 1
+    t = (kt - 1) ÷ Int(K) + 1
+    @inbounds e = Int(sel[k, t])
+    base = (e - 1) * per
+    g = q4_dot(data, base + (i - 1) * Int(nb) * 18, X, t, Int(nb))
+    u = q4_dot(data, base + (i - 1 + Int(nf)) * Int(nb) * 18, X, t, Int(nb))
+    @inbounds act[i, kt] = gelu_tanh(g) * u
+end
+
+@kernel function _moe_down!(moe, @Const(data), @Const(sel), @Const(w),
+        @Const(act), nb::Int32, K::Int32, per::Int)
+    d, t = @index(Global, NTuple)
+    s = 0.0f0
+    @inbounds for k in 1:Int(K)
+        e = Int(sel[k, t])
+        s = muladd(Float32(w[k, t]),
+            q4_dot(data, (e - 1) * per + (d - 1) * Int(nb) * 18,
+                act, (t - 1) * Int(K) + k, Int(nb)), s)
+    end
+    @inbounds moe[d, t] = s
 end
 
 mutable struct KVCache{A <: AbstractArray{Float32, 3}}
@@ -264,16 +295,16 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
         c.K[il][:, :, (P + 1):(P + T)] = k
         c.V[il][:, :, (P + 1):(P + T)] = v
         att = similar(h, hd * nh, T)
-        if T == 1
-            Kp = P + 1
-            wstart = L.is_swa ? max(1, Kp - m.n_swa + 1) : 1
-            S = similar(h, Kp, nh)
-            _attn1_scores!(get_backend(S))(S, c.K[il], reshape(q, hd, nh),
-                Int32(nh ÷ nkv), Int32(wstart); ndrange = (Kp, nh))
+        ongpu = !(get_backend(h) isa KernelAbstractions.CPU)
+        if T == 1 || ongpu
+            Kp = P + T
+            S = similar(h, Kp, nh, T)
+            _attn_scores!(get_backend(S))(S, c.K[il], q, Int32(nh ÷ nkv),
+                Int32(P), Int32(L.is_swa ? m.n_swa : 0); ndrange = (Kp, nh, T))
             S = exp.(S .- maximum(S; dims = 1))
             S ./= sum(S; dims = 1)
-            _attn1_out!(get_backend(att))(att, c.V[il], S, Int32(nh ÷ nkv),
-                Int32(hd); ndrange = (hd, nh))
+            _attn_out!(get_backend(att))(att, c.V[il], S, Int32(nh ÷ nkv),
+                Int32(hd); ndrange = (hd, nh, T))
         else
             for hh in 1:nh
                 kv = 1 + (hh - 1) * nkv ÷ nh
@@ -308,7 +339,22 @@ function step!(m::Model, c::KVCache, toks::Vector{<:Integer})
         sel = [partialsortperm(view(pc, :, t), 1:m.n_expert_used; rev = true)
                for t in 1:T]
         wsum = [max(sum(pc[e, t] for e in sel[t]), 6.103515625f-5) for t in 1:T]
-        if T == 1
+        if ongpu
+            K = m.n_expert_used
+            gu, dn = L.gate_up_exps, L.down_exps
+            seld = copyto!(similar(h, Int32, K, T),
+                Int32[sel[t][k] for k in 1:K, t in 1:T])
+            wd = copyto!(similar(h, K, T),
+                Float32[pc[sel[t][k], t] / wsum[t] * L.down_exps_s[sel[t][k]]
+                        for k in 1:K, t in 1:T])
+            act = similar(h, nf, K * T)
+            _moe_act!(get_backend(h))(act, gu.data, seld, moe_in,
+                Int32(gu.nrow ÷ 32), Int32(nf), Int32(K), perexp(gu);
+                ndrange = (nf, K * T))
+            _moe_down!(get_backend(h))(moe, dn.data, seld, wd, act,
+                Int32(dn.nrow ÷ 32), Int32(K), perexp(dn);
+                ndrange = (m.n_embd, T))
+        elseif T == 1
             for e in sel[1]                            # scalar weights, no
                 GU = L.gate_up_exps[e]' * moe_in       # gather/scatter/upload
                 act = gelu_tanh.(view(GU, 1:nf, :)) .*
@@ -363,8 +409,7 @@ Adapt.adapt_structure(to, L::Layer) = Layer(
     Adapt.adapt(to, L.ffn_post_norm), Adapt.adapt(to, L.ffn_post_norm_1),
     Adapt.adapt(to, L.ffn_pre_norm_2), Adapt.adapt(to, L.ffn_post_norm_2),
     Adapt.adapt(to, L.gate_inp), Adapt.adapt(to, L.gate_inp_s),
-    [Adapt.adapt(to, W) for W in L.gate_up_exps],
-    [Adapt.adapt(to, W) for W in L.down_exps],
+    Adapt.adapt(to, L.gate_up_exps), Adapt.adapt(to, L.down_exps),
     L.down_exps_s)
 
 Adapt.adapt_structure(to, m::Model) = Model(
