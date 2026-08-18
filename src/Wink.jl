@@ -25,6 +25,8 @@ using Markdown
 using REPL
 using InteractiveUtils
 import Pkg
+import HTTP
+import Sockets
 import Downloads
 import JSON3
 import Adapt
@@ -54,7 +56,7 @@ include("compact.jl")
 include("repl.jl")
 
 export configure!, autoeval!, ask, reset!, compact!, reindex!, index_packages!,
-       local_model!
+       local_model!, prefer_ipv4!
 
 function __init__()
     # CONFIG is constructed during precompilation, so its status_io field holds
