@@ -21,33 +21,43 @@ using LinearAlgebra
 using KernelAbstractions
 import Adapt
 
-using ..GGUF: GGUFFile, tensor, metadata
+using ..GGUF: GGUFFile, tensor, metadata, raw_tensor
+using ..Quant: Q4_0Stack, Q4_1Matrix
 
 export load_model, forward, generate, KVCache, step!
 
-struct Layer{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32},
-        A3 <: AbstractArray{Float32, 3}}
-    attn_norm::V
-    wq::M
-    wk::M
-    wv::M
-    wo::M
-    q_norm::V
-    k_norm::V
-    ffn_norm::V
-    w_router::M      # n_embd × n_expert
-    gate_exps::A3    # n_embd × n_ff × n_expert
-    up_exps::A3
-    down_exps::A3    # n_ff × n_embd × n_expert
+# a 3-D dense expert tensor with the same per-expert indexing interface as
+# Q4_0Stack, so moe_ffn! is agnostic to quantization
+struct DenseStack{A <: AbstractArray{Float32, 3}}
+    data::A
+end
+Base.getindex(s::DenseStack, e::Integer) = view(s.data, :, :, e)
+Base.length(s::DenseStack) = size(s.data, 3)
+Adapt.adapt_structure(to, s::DenseStack) = DenseStack(Adapt.adapt(to, s.data))
+
+# abstract fields: quantized files mix storage types (q4_0 attn/experts,
+# q8_0/q6_K embeddings), and expert stacks may be dense or quantized
+struct Layer
+    attn_norm::AbstractVector{Float32}
+    wq::AbstractMatrix{Float32}
+    wk::AbstractMatrix{Float32}
+    wv::AbstractMatrix{Float32}
+    wo::AbstractMatrix{Float32}
+    q_norm::AbstractVector{Float32}
+    k_norm::AbstractVector{Float32}
+    ffn_norm::AbstractVector{Float32}
+    w_router::AbstractMatrix{Float32}         # n_embd × n_expert
+    gate_exps::Union{DenseStack, Q4_0Stack, Vector}  # [n_embd, n_ff] × n_expert
+    up_exps::Union{DenseStack, Q4_0Stack, Vector}
+    down_exps::Union{DenseStack, Q4_0Stack, Vector}
 end
 Adapt.@adapt_structure Layer
 
-struct Model{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32},
-        A3 <: AbstractArray{Float32, 3}}
-    embd::M          # n_embd × vocab
-    output::M        # n_embd × vocab (untied head)
-    layers::Vector{Layer{V, M, A3}}
-    out_norm::V
+struct Model
+    embd::AbstractMatrix{Float32}     # n_embd × vocab
+    output::AbstractMatrix{Float32}   # n_embd × vocab (untied head)
+    layers::Vector{Layer}
+    out_norm::AbstractVector{Float32}
     n_head::Int
     n_kv::Int
     head_dim::Int
@@ -60,6 +70,21 @@ Adapt.adapt_structure(to, m::Model) = Model(Adapt.adapt(to, m.embd),
     Adapt.adapt(to, m.output), [Adapt.adapt(to, L) for L in m.layers],
     Adapt.adapt(to, m.out_norm), m.n_head, m.n_kv, m.head_dim,
     m.n_expert_used, m.eps, m.rope_base)
+
+# an expert stack: zero-copy q4_0 view of the 3-D tensor, or dense
+function _experts(f::GGUFFile, name::AbstractString)
+    typ = f.tensors[name].typ
+    if typ == 2
+        bytes, dims, _ = raw_tensor(f, name)
+        return Q4_0Stack(bytes, dims[1], dims[2], dims[3])
+    elseif typ == 3   # q4_1 slabs (llama.cpp bumps a few tensors in q4_0 files)
+        bytes, dims, _ = raw_tensor(f, name)
+        per = (dims[1] ÷ 32) * 20 * dims[2]
+        return [Q4_1Matrix(view(bytes, ((e - 1) * per + 1):(e * per)),
+                    dims[1], dims[2]) for e in 1:dims[3]]
+    end
+    return DenseStack(tensor(f, name))
+end
 
 function load_model(f::GGUFFile)
     arch = metadata(f, "general.architecture")
@@ -74,9 +99,9 @@ function load_model(f::GGUFFile)
             vec(tensor(f, p * "attn_k_norm.weight")),
             vec(tensor(f, p * "ffn_norm.weight")),
             tensor(f, p * "ffn_gate_inp.weight"),
-            tensor(f, p * "ffn_gate_exps.weight"),
-            tensor(f, p * "ffn_up_exps.weight"),
-            tensor(f, p * "ffn_down_exps.weight"))
+            _experts(f, p * "ffn_gate_exps.weight"),
+            _experts(f, p * "ffn_up_exps.weight"),
+            _experts(f, p * "ffn_down_exps.weight"))
     end
     ne = Int(metadata(f, "olmoe.embedding_length"))
     nh = Int(metadata(f, "olmoe.attention.head_count"))
@@ -148,13 +173,13 @@ function moe_ffn!(out::AbstractMatrix, L::Layer, xn::AbstractMatrix, n_used::Int
     p ./= sum(p; dims = 1)
     pc = Array(p)                              # routing decisions on the CPU
     sel = [partialsortperm(view(pc, :, t), 1:n_used; rev = true) for t in 1:T]
-    for e in axes(L.gate_exps, 3)
+    for e in 1:length(L.gate_exps)
         cols = [t for t in 1:T if e in sel[t]]
         isempty(cols) && continue
         Xs = xn[:, cols]
-        G = (@view L.gate_exps[:, :, e])' * Xs
-        U = (@view L.up_exps[:, :, e])' * Xs
-        Y = (@view L.down_exps[:, :, e])' * (silu.(G) .* U)
+        G = L.gate_exps[e]' * Xs
+        U = L.up_exps[e]' * Xs
+        Y = L.down_exps[e]' * (silu.(G) .* U)
         w = reshape([pc[e, t] for t in cols], 1, :)
         view(out, :, cols) .+= Y .* w
     end

@@ -23,7 +23,7 @@ import Adapt
 import SIMD
 import SIMD: Vec, vload
 
-export Q4_0Matrix, Q8_0Matrix, Q6_KMatrix, Q4_0Stack
+export Q4_0Matrix, Q4_1Matrix, Q8_0Matrix, Q6_KMatrix, Q4_0Stack
 
 # storage decides where the math runs: mmap views are CPU, device vectors GPU
 _bytes_backend(d) =
@@ -178,6 +178,7 @@ end
 const QK = 32
 const BLOCK = 18
 const BLOCK8 = 34
+const BLOCK41 = 20
 const QK6 = 256
 const BLOCK6 = 210
 
@@ -309,6 +310,71 @@ function LinearAlgebra.mul!(Y::StridedVecOrMat{Float32},
                         X[xoff + i, t], s)
                 end
                 acc = muladd(_scale(data, off), s, acc)
+            end
+            @inbounds Y[j, t] = acc
+        end
+    end
+    return Y
+end
+
+
+# ---- q4_1 ---------------------------------------------------------------------
+#
+# 32 weights/block, 20 bytes: f16 scale d + f16 min m + 16 nibble bytes;
+# w = d * q + m. llama.cpp's mixed-quant recipes bump a few tensors to
+# q4_1 inside "q4_0" files (e.g. OLMoE's first-layer ffn_down_exps); they
+# carry a small share of the math, so this type has the portable f32
+# paths only — no SDOT, no device kernel.
+
+struct Q4_1Matrix{D <: AbstractVector{UInt8}} <: AbstractMatrix{Float32}
+    data::D
+    nrow::Int
+    ncol::Int
+    function Q4_1Matrix(data::D, nrow::Integer, ncol::Integer) where {D}
+        nrow % QK == 0 || error("q4_1 rows must be a multiple of $QK")
+        length(data) == (nrow ÷ QK) * BLOCK41 * ncol ||
+            error("q4_1 data size mismatch")
+        new{D}(data, Int(nrow), Int(ncol))
+    end
+end
+
+Base.size(A::Q4_1Matrix) = (A.nrow, A.ncol)
+
+Base.@propagate_inbounds function Base.getindex(A::Q4_1Matrix, i::Int, j::Int)
+    @boundscheck checkbounds(A, i, j)
+    b, p = divrem(i - 1, QK)
+    off = ((j - 1) * (A.nrow ÷ QK) + b) * BLOCK41
+    q = A.data[off + 4 + (p % 16) + 1]
+    nib = p < 16 ? (q & 0x0f) : (q >> 4)
+    return _scale(A.data, off) * Float32(nib) + _scale(A.data, off + 2)
+end
+
+function LinearAlgebra.mul!(Y::StridedVecOrMat{Float32},
+        At::Adjoint{Float32, <:Q4_1Matrix}, X::StridedVecOrMat{Float32})
+    A = parent(At)
+    size(X, 1) == A.nrow || throw(DimensionMismatch("q4_1 mul"))
+    _bytes_backend(A.data) isa KernelAbstractions.CPU ||
+        error("q4_1 has no device kernel (host-only tensor type)")
+    nb = A.nrow ÷ QK
+    data = A.data
+    T = size(X, 2)
+    Threads.@threads for j in 1:A.ncol
+        colbase = (j - 1) * nb * BLOCK41
+        for t in 1:T
+            acc = 0.0f0
+            @inbounds for b in 0:(nb - 1)
+                off = colbase + b * BLOCK41
+                s = 0.0f0
+                sx = 0.0f0
+                xoff = b * QK
+                @simd for i in 1:16
+                    q = data[off + 4 + i]
+                    s = muladd(Float32(q & 0x0f), X[xoff + i, t], s)
+                    s = muladd(Float32(q >> 4), X[xoff + 16 + i, t], s)
+                    sx += X[xoff + i, t] + X[xoff + 16 + i, t]
+                end
+                acc = muladd(_scale(data, off), s,
+                    muladd(_scale(data, off + 2), sx, acc))
             end
             @inbounds Y[j, t] = acc
         end
@@ -566,7 +632,7 @@ end
 
 # ---- shared interface ---------------------------------------------------------
 
-const AnyQuant = Union{Q4_0Matrix, Q8_0Matrix, Q6_KMatrix}
+const AnyQuant = Union{Q4_0Matrix, Q4_1Matrix, Q8_0Matrix, Q6_KMatrix}
 
 # activations and caches allocated "like" quantized weights are plain arrays
 Base.similar(A::AnyQuant, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
@@ -578,6 +644,8 @@ KernelAbstractions.get_backend(A::AnyQuant) = _bytes_backend(A.data)
 # the entire multi-GB file once per tensor
 Adapt.adapt_structure(to, A::Q4_0Matrix) =
     Q4_0Matrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
+Adapt.adapt_structure(to, A::Q4_1Matrix) =
+    Q4_1Matrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
 Adapt.adapt_structure(to, A::Q8_0Matrix) =
     Q8_0Matrix(Adapt.adapt(to, collect(A.data)), A.nrow, A.ncol)
 Adapt.adapt_structure(to, A::Q6_KMatrix) =
