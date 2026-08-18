@@ -51,6 +51,16 @@
     Wink.configure!(chat_api_base = "")
     @test isempty(Wink.CONFIG.chat_api_base)
 
+    # claude models newer than the pinned PT registry must still route to
+    # Anthropic — a registry miss would silently fall through to PT's
+    # default OpenAI schema ("api_key cannot be empty" with a good
+    # ANTHROPIC_API_KEY set)
+    @test Wink._model_schema("claude-opus-5") isa PT.AnthropicSchema
+    @test PT.MODEL_REGISTRY["claude-opus-5"].schema isa PT.AnthropicSchema
+    @test Wink._model_schema("claude-fable-5-unheard-of") isa PT.AnthropicSchema
+    # known registry entries keep their spec schema
+    @test Wink._model_schema("claude-3-5-sonnet-latest") isa PT.AbstractAnthropicSchema
+
     # ...and the same for embedding models via embed_api_base
     @test_logs Wink.configure!(embed_model = "wink-local-embed-xyz",
         embed_api_base = "http://localhost:1234/v1")

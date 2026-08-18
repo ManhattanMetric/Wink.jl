@@ -55,11 +55,22 @@ end
 const CONFIG = WinkConfig()
 
 # Model routing: resolve the alias, look the model up in PT's registry, and
-# return its schema (nothing when unregistered).
+# return its schema. The pinned PromptingTools release's registry predates
+# newer model families (e.g. claude-*-5), and an unregistered model would
+# fall through to PT's DEFAULT schema — OpenAI — at call time, surfacing as
+# "api_key cannot be empty" with a perfectly good ANTHROPIC_API_KEY set. So
+# a registry miss on a recognizable provider prefix infers the schema and
+# self-registers the model, letting PT's own by-name resolution route the
+# actual call correctly (flattening and max_tokens handling included).
 function _model_schema(model::AbstractString)
     id = get(PT.MODEL_ALIASES, model, model)
     spec = get(PT.MODEL_REGISTRY, id, nothing)
-    return spec === nothing ? nothing : spec.schema
+    spec === nothing || return spec.schema
+    if startswith(id, "claude")
+        ensure_registered!(id, PT.AnthropicSchema())
+        return PT.AnthropicSchema()
+    end
+    return nothing
 end
 
 # Shared routing for OpenAI-compatible custom servers: the url override, plus
@@ -77,7 +88,7 @@ end
 const OLLAMA_CHAT_DEFAULT = "llama3.1"
 const OLLAMA_EMBED_DEFAULT = "nomic-embed-text"
 const OPENAI_EMBED_DEFAULT = "text-embedding-3-small"
-const ANTHROPIC_CHAT_DEFAULT = "claude-opus-4-8"
+const ANTHROPIC_CHAT_DEFAULT = "claude-opus-5"
 
 function ensure_registered!(name::AbstractString, schema::PT.AbstractPromptSchema)
     if !haskey(PT.MODEL_REGISTRY, String(name))
