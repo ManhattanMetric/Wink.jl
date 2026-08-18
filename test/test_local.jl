@@ -73,6 +73,31 @@
     @test startswith(r, base)
 end
 
+@testset "zephyr template family (OLMo/OLMoE)" begin
+    tpl = "{{ bos_token }}{% for message in messages %}... '<|user|>\n' ... '<|assistant|>\n' ..."
+    @test Wink.template_family(tpl) isa Wink.ZephyrTemplate
+    @test Wink.stop_pieces(Wink.ZephyrTemplate()) == ("<|endoftext|>",)
+
+    z = Wink.ZephyrTemplate()
+    msgs = [(role = "system", content = "You are terse."),
+        (role = "user", content = "Hi there")]
+    r = Wink.render_chat(z, msgs; add_assistant = true)
+    @test r == "<|system|>\nYou are terse.\n<|user|>\nHi there\n<|assistant|>\n"
+    # base is a strict prefix of full (the KV design invariant)
+    @test startswith(r, Wink.render_chat(z, msgs; add_assistant = false))
+
+    push!(msgs, (role = "assistant", content = "Hello."))
+    push!(msgs, (role = "user", content = "Bye"))
+    r2 = Wink.render_chat(z, msgs; add_assistant = true)
+    # assistant turns close with the model's own eos, per its template
+    @test occursin("<|assistant|>\nHello.<|endoftext|>\n", r2)
+    @test endswith(r2, "<|user|>\nBye\n<|assistant|>\n")
+
+    # text-only: tools are refused, not degraded
+    @test_throws Exception Wink.render_chat(z, msgs;
+        tools = [Dict("function" => Dict("name" => "f"))])
+end
+
 @testset "gemma3 template family" begin
     # detection: gemma-3's start_of_turn family, distinct from gemma-4's
     @test Wink.template_family("{{ '<start_of_turn>' }}...") isa Wink.Gemma3Template

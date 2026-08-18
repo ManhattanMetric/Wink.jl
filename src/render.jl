@@ -33,8 +33,11 @@ struct ChatMLTemplate <: ChatTemplate end
 # on these. GGUF metadata often omits eot_token_id (gemma-4's does);
 # llama.cpp compensates with a hardcoded piece list in its vocab loader,
 # and this is our equivalent, keyed by family instead of guessed globally.
+struct ZephyrTemplate <: ChatTemplate end
+
 stop_pieces(::Gemma4Template) = ("<turn|>", "<eos>")
 stop_pieces(::Gemma3Template) = ("<end_of_turn>", "<eos>")
+stop_pieces(::ZephyrTemplate) = ("<|endoftext|>",)
 stop_pieces(::ChatTemplate) = ("<|im_end|>", "<|endoftext|>", "<eos>", "<eot>")
 
 # Field access over NamedTuples and Dicts alike.
@@ -58,6 +61,9 @@ function template_family(template_text::Union{Nothing, AbstractString};
         return Gemma4Template()
     template_text !== nothing && occursin("start_of_turn", template_text) &&
         return Gemma3Template()
+    template_text !== nothing && occursin("<|user|>", template_text) &&
+        occursin("<|assistant|>", template_text) &&
+        return ZephyrTemplate()
     template_text !== nothing && native_probe !== nothing && native_probe() &&
         return NativeTemplate(String(template_text))
     return ChatMLTemplate()
@@ -68,6 +74,33 @@ end
 render_chat(::ChatMLTemplate, msgs; tools = (), add_assistant::Bool = true) =
     join("<|im_start|>$(mrole(m))\n$(mcontent(m))<|im_end|>\n" for m in msgs) *
     (add_assistant ? "<|im_start|>assistant\n" : "")
+
+# ---- Zephyr (OLMo/OLMoE, Tulu-style) ------------------------------------------
+#
+# The <|role|> family, per llama.cpp's canonical zephyr rendering: BOS is
+# never rendered as text (OLMoE sets add_bos_token = false anyway), each
+# turn is "<|role|>\ncontent\n", and assistant turns close with the
+# <|endoftext|> eos per the model's own template. Text-only — no canonical
+# tool-call format; tools are withheld upstream, not degraded here.
+
+function render_chat(::ZephyrTemplate, msgs; tools = (), add_assistant::Bool = true)
+    isempty(tools) ||
+        error("ZephyrTemplate is text-only (OLMo/zephyr has no canonical " *
+              "tool-call format); tools require another family")
+    io = IOBuffer()
+    for m in msgs
+        role = mrole(m)
+        content = strip(mcontent(m))
+        if role == "assistant"
+            print(io, "<|assistant|>\n", content, "<|endoftext|>\n")
+        else
+            print(io, "<|", role in ("system", "developer") ? "system" : "user",
+                "|>\n", content, "\n")
+        end
+    end
+    add_assistant && print(io, "<|assistant|>\n")
+    return String(take!(io))
+end
 
 # ---- Gemma 3 ------------------------------------------------------------------
 #
