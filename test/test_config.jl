@@ -5,7 +5,7 @@
         PT.load_api_keys!()
         Wink.detect_providers!(cfg)
     end
-    @test cfg.chat_model == "claude-opus-4-8"
+    @test cfg.chat_model == "claude-opus-5"
     @test cfg.embed_model == "nomic-embed-text"
 
     withenv("ANTHROPIC_API_KEY" => nothing, "OPENAI_API_KEY" => "sk-test") do
@@ -27,7 +27,7 @@
         PT.load_api_keys!()
         Wink.detect_providers!(cfg)
     end
-    @test cfg.chat_model == "claude-opus-4-8"
+    @test cfg.chat_model == "claude-opus-5"
     @test cfg.embed_model == "text-embedding-3-small"
 
     # restore the ambient environment's keys for later suites
