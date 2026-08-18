@@ -25,10 +25,11 @@ using TestPkg
     include("test_repl.jl")
     include("test_edit.jl")
     include("test_rag.jl")
-    # the pure/ spike dir hosts the llama.cpp oracle batteries against the
-    # SAME engine files that ship in src/ — they must not drift
+    # dev checkouts on the olmoe-tuning branch carry a pure/ spike dir with
+    # llama.cpp oracle batteries against the SAME engine files that ship in
+    # src/ — when present, they must not drift
     let spike = joinpath(dirname(@__DIR__), "pure")
-        if isdir(spike)   # dev checkouts only
+        if isfile(joinpath(spike, "quant.jl"))   # olmoe-tuning checkouts only
             @testset "spike/src engine sync" begin
                 for f in ("quant.jl", "gguf.jl", "tokenizer.jl",
                           "gemma3.jl", "gemma4.jl", "olmoe.jl")
