@@ -1,8 +1,0 @@
-[deps]
-Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-CEnum = "fa961155-64e5-5f13-b03f-caf6b980ea82"
-Clang = "40e3b903-d033-50b4-a0cc-940c62c95e31"
-JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
-KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
-Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
-SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"

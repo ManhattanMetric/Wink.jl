@@ -3,3 +3,9 @@
 /docs/build/
 .CondaPkg/
 pure/models/
+
+# dev-only trees (llama.cpp oracle harness, inference spike) live on the
+# olmoe-tuning branch; never ship them from the release branch
+/spike/
+/pure/
+*.cov

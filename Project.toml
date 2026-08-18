@@ -1,6 +1,6 @@
 name = "Wink"
 uuid = "9541d238-a10b-4915-97cf-11ce6d18e9b8"
-version = "0.1.0-DEV"
+version = "0.1.0"
 authors = ["Josh Ballanco <josh.ballanco@manhattanmetric.com> and contributors"]
 
 [deps]

@@ -4,11 +4,14 @@
 # text a model family expects. Families are types, so supporting a new model
 # is defining a method — not patching a matcher. Three methods here:
 #
-#   Gemma4Template  — hand-implemented from spike/gemma4_template.jinja (the
-#                     "Gemma 4 Canonical Chat Template", 2026-07-09), which
-#                     llama.cpp's C matcher does not recognize. Validated
-#                     byte-for-byte against Python jinja2 rendering the real
-#                     template (see test_render.jl).
+#   Gemma4Template  — hand-implemented from the model's own chat template
+#                     ("Gemma 4 Canonical Chat Template", 2026-07-09;
+#                     preserved as spike/gemma4_template.jinja on the
+#                     olmoe-tuning branch), which llama.cpp's C matcher
+#                     does not recognize. Validated byte-for-byte against
+#                     Python jinja2 rendering the real template
+#                     (spike/test_render.jl, olmoe-tuning branch; the
+#                     shipped render coverage lives in test_local.jl).
 #   NativeTemplate  — delegate to llama.cpp's C-side matcher for the families
 #                     it does know (Nemotron et al.). Text-only: no tools.
 #   ChatMLTemplate  — last-resort fallback, reported loudly by callers.
