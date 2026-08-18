@@ -85,54 +85,11 @@ function custom_server_kwargs(schema, api_base::AbstractString)
     return api_kwargs, key_kwargs
 end
 
-"""
-    prefer_ipv4!()
-
-Dial IPv4 before IPv6 for Wink's provider HTTP traffic, for this session.
-
-Julia's HTTP stack tries resolved addresses sequentially with no
-happy-eyeballs fallback: on a dual-stack network whose IPv6 is advertised
-but broken (v6 routes black-hole — common on residential routers), every
-provider call burns its whole connect timeout on the dead IPv6 route and
-surfaces as `ConnectError … try_with_timeout timed out`. Prefer fixing the
-network itself (macOS: `networksetup -setv6off Wi-Fi`, or repair the
-router's IPv6) — that helps every application, not just Wink. This
-override redefines the dialer inside the loaded HTTP.jl, so it lasts only
-until the session ends and touches nothing on disk.
-"""
-function prefer_ipv4!()
-    Core.eval(HTTP.Connections, quote
-        function getconnection(::Type{TCPSocket},
-                host::AbstractString,
-                port::AbstractString;
-                keepalive::Bool = true,
-                readtimeout::Int = 0,
-                kw...)::TCPSocket
-            p::UInt = isempty(port) ? UInt(80) : parse(UInt, port)
-            addrs = sort(Sockets.getalladdrinfo(host);
-                by = a -> a isa Sockets.IPv4 ? 0 : 1)
-            err = ErrorException("failed to connect")
-            for addr in addrs
-                try
-                    tcp = Sockets.connect(addr, p)
-                    keepalive && keepalive!(tcp)
-                    return tcp
-                catch e
-                    err = e
-                end
-            end
-            throw(err)
-        end
-    end)
-    printstyled(CONFIG.status_io,
-        "  [Wink] IPv4-first dialing enabled for this session\n";
-        color = :light_black)
-    return nothing
-end
-
 # A connect timeout on a host whose resolution is IPv6-first is, in every
-# observed case, the broken-dual-stack condition prefer_ipv4! exists for —
-# name the cause and both remedies instead of leaving a bare timeout.
+# observed case, advertised-but-broken IPv6: Julia's HTTP stack dials
+# address families sequentially (no happy-eyeballs), so a black-holed v6
+# route consumes the whole connect budget before the working IPv4 is ever
+# tried. Name the cause and the remedy instead of leaving a bare timeout.
 function _connect_hint(e)
     e isa HTTP.Exceptions.ConnectError || return nothing
     occursin("imeout", sprint(showerror, e)) || return nothing
@@ -148,11 +105,11 @@ function _connect_hint(e)
     end
     v6first || return nothing
     return "hint: $host resolves IPv6-first and the connection timed out — " *
-           "on networks with advertised-but-broken IPv6, Julia's HTTP " *
-           "stack never reaches the working IPv4 route (no happy-eyeballs). " *
-           "Check with `curl -6 https://$host`; fix the network (macOS: " *
-           "networksetup -setv6off Wi-Fi) or run Wink.prefer_ipv4!() for " *
-           "this session."
+           "this usually means the network advertises IPv6 but black-holes " *
+           "it, so Julia's HTTP stack never reaches the working IPv4 route " *
+           "(no happy-eyeballs). Check with `curl -6 https://$host`; fix " *
+           "the network (reset the connection, repair the router's IPv6, " *
+           "or macOS: networksetup -setv6off Wi-Fi)."
 end
 
 const OLLAMA_CHAT_DEFAULT = "llama3.1"

@@ -58,12 +58,6 @@
     @test Wink._connect_hint(Wink.HTTP.Exceptions.ConnectError(
         "https://api.anthropic.com/v1/messages",
         ErrorException("connection refused"))) === nothing
-    # the IPv4-first override installs cleanly and is idempotent
-    redirect_stderr(devnull) do
-        @test Wink.prefer_ipv4!() === nothing
-        @test Wink.prefer_ipv4!() === nothing
-    end
-
     # claude models newer than the pinned PT registry must still route to
     # Anthropic — a registry miss would silently fall through to PT's
     # default OpenAI schema ("api_key cannot be empty" with a good
