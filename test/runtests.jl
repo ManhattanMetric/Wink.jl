@@ -8,6 +8,11 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
 FIXTURES in LOAD_PATH || push!(LOAD_PATH, FIXTURES)
 using TestPkg
 
+# Synthetic GGUF models/vocabularies and llama.cpp's recorded outputs for them
+include("inference_fixtures.jl")
+using .InferenceFixtures
+include(joinpath(FIXTURES, "inference_goldens.jl"))
+
 @testset "Wink.jl" begin
     @testset "smoke" begin
         @test Wink isa Module
@@ -22,6 +27,10 @@ using TestPkg
     include("test_agent.jl")
     include("test_compact.jl")
     include("test_local.jl")
+    include("test_quant.jl")
+    include("test_gguf.jl")
+    include("test_tokenizers.jl")
+    include("test_models.jl")
     include("test_repl.jl")
     include("test_edit.jl")
     include("test_rag.jl")
