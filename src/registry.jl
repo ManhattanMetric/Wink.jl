@@ -57,12 +57,21 @@ function _github_graphql(query::AbstractString, token::AbstractString;
     end
 end
 
+# Pkg's registry_info gained a registry argument in Julia 1.13; older
+# versions take the entry alone.
+const _REGISTRY_INFO_TAKES_REGISTRY = hasmethod(Pkg.Registry.registry_info,
+    Tuple{Pkg.Registry.RegistryInstance, Pkg.Registry.PkgEntry})
+
+registry_info(reg, e) = _REGISTRY_INFO_TAKES_REGISTRY ?
+                        Pkg.Registry.registry_info(reg, e) :
+                        Pkg.Registry.registry_info(e)
+
 # All non-_jll registry packages hosted on GitHub, as (name, owner, repo).
 function github_repos_from_registry()
     pairs = Tuple{String, String, String}[]
     for reg in Pkg.Registry.reachable_registries(), e in values(reg.pkgs)
         endswith(lowercase(e.name), "_jll") && continue
-        info = Pkg.Registry.registry_info(e)
+        info = registry_info(reg, e)
         m = match(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$", something(info.repo, ""))
         m === nothing && continue
         push!(pairs, (e.name, String(m.captures[1]), String(m.captures[2])))
@@ -182,9 +191,10 @@ function search_packages_text(pattern::AbstractString; limit::Integer = 40)
     isempty(regs) &&
         return "No package registries found on disk (run Pkg.Registry.add())."
     regnames = join((r.name for r in regs), ", ")
-    entries = Dict{String, Pkg.Registry.PkgEntry}()
+    entries = Dict{String, Tuple{Pkg.Registry.RegistryInstance,
+        Pkg.Registry.PkgEntry}}()
     for reg in regs, e in values(reg.pkgs)
-        entries[e.name] = e
+        entries[e.name] = (reg, e)
     end
     # Rank layers: 0 exact name, 1 name prefix, 2 name substring, 3 description
     # keyword, 4 topic keyword, 5 semantic. A package keeps its best rank.
@@ -240,7 +250,7 @@ function search_packages_text(pattern::AbstractString; limit::Integer = 40)
             println(io, "  … and ", length(names) - limit, " more (narrow the pattern)")
             break
         end
-        info = Pkg.Registry.registry_info(entries[name])
+        info = registry_info(entries[name]...)
         vs = [v for (v, vi) in info.version_info if !vi.yanked]
         ver = isempty(vs) ? "(all versions yanked)" : "v" * string(maximum(vs))
         desc = get(descmap, name, nothing)
