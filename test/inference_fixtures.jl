@@ -184,14 +184,23 @@ const SPM_PIECES = ["▁", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
     "=", "(", ")", "1", "2", "3", "▁t", "he", "▁the", "▁a", "in", "▁in", "ll",
     "lo", "▁h", "hel", "hello", "▁hello", "or", "ld", "▁w", "wor", "world",
     "▁world", "un", "▁f", "▁fun", "ct", "on", "ion", "ction", "▁function",
-    "ul", "ia", "▁j", "▁jul", "▁julia", "▁=", "12", "123"]
+    "ul", "ia", "▁j", "▁jul", "▁julia", "▁=", "12", "123",
+    # where the merge rules part: SPM scores favor xy (earlier, so higher),
+    # gemma-4's ranks favor yz (earlier merge) — "xyz" splits differently
+    "x", "z", "xy", "yz", "\n\n"]
+
+# appended after the scored pieces so earlier ids stay put: pieces llama.cpp
+# reclassifies at load regardless of declared type (gemma-4 declares these
+# two user-defined), and </s>, which gemma-4's workaround demotes to text
+const SPM_LATE_SPECIALS = [("<turn|>", 4), ("<|tool_response>", 4), ("</s>", 3)]
 
 # gemma-4 vocabularies are merge-ranked (llama.cpp loads them as BPE over
 # SPM-style pieces); each multi-symbol piece above as one binary merge
 const SPM_MERGES = ["▁ t", "h e", "▁t he", "▁ a", "i n", "▁ in", "l l", "l o",
     "▁ h", "he l", "hel lo", "▁ hello", "o r", "l d", "▁ w", "w or", "wor ld",
     "▁ world", "u n", "▁ f", "▁f un", "c t", "o n", "i on", "ct ion",
-    "▁fun ction", "u l", "i a", "▁ j", "▁j ul", "▁jul ia", "▁ =", "1 2", "12 3"]
+    "▁fun ction", "u l", "i a", "▁ j", "▁j ul", "▁jul ia", "▁ =", "1 2", "12 3",
+    "y z", "x y", "\n \n"]
 
 """
     spm_vocab_meta(; model = "llama") -> (meta pairs, n_vocab)
@@ -213,6 +222,9 @@ function spm_vocab_meta(; model::String = "llama")
     for (i, p) in enumerate(SPM_PIECES)
         push!(toks, p); push!(types, 1)
         push!(scores, Float32(length(p)) - 0.001f0 * i)
+    end
+    for (p, t) in SPM_LATE_SPECIALS
+        push!(toks, p); push!(types, t); push!(scores, 0)
     end
     meta = Pair{String, Any}[
         "tokenizer.ggml.model" => model,

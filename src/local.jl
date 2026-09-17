@@ -106,11 +106,11 @@ function local_model!(path::AbstractString; n_ctx::Integer = 16_384,
         error("local backend has no $arch forward pass (have: " *
               join(sort(collect(keys(LOCAL_ENGINES))), ", ") * ")")
     tokmodel = String(GGUF.metadata(f, "tokenizer.ggml.model", "llama"))
-    # "gemma4" is SPM with gemma-4's vocab conventions — the pure SPM
-    # tokenizer handles it (oracle-verified on the 26B QAT file)
+    # "gemma4" shares SPM's vocabulary shape but merges by rank, not score;
+    # SPMTokenizer selects the rule from the same metadata key
     tokmod = tokmodel in ("llama", "gemma4") ? SPMTokenizer :
              tokmodel == "gpt2" ? BPETokenizer :
-             error("local backend has no \"$tokmodel\" tokenizer (llama/gpt2)")
+             error("local backend has no \"$tokmodel\" tokenizer (llama/gemma4/gpt2)")
     tok = tokmod.Tokenizer(f)
     m = engine.load_model(f)
     gpu = array === nothing ? nothing : Adapt.adapt(array, m)

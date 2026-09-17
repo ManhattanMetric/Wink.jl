@@ -7,6 +7,7 @@
 
     @testset "$name matches llama.cpp" for (name, build, TK) in (
             ("spm", p -> tiny_gemma3!(p), Wink.SPMTokenizer),
+            ("gemma4", p -> tiny_gemma4!(p), Wink.SPMTokenizer),
             ("bpe", p -> tiny_olmoe!(p), Wink.BPETokenizer))
         g = GOLDEN_TOKENIZERS[name]
         path = build(joinpath(dir, "$name.gguf"))
@@ -39,6 +40,38 @@
               "the function julia"
         @test S.piece(t, t.eos; special = false) == ""
         @test S.piece(t, t.eos) == "<eos>"
+    end
+
+    @testset "gemma-4 merge-ranked behaviors" begin
+        S = Wink.SPMTokenizer
+        f3 = Wink.GGUF.GGUFFile(tiny_gemma3!(joinpath(dir, "g3.gguf")))
+        f4 = Wink.GGUF.GGUFFile(tiny_gemma4!(joinpath(dir, "g4.gguf")))
+        t3, t4 = S.Tokenizer(f3), S.Tokenizer(f4)
+        @test !S.ranked(t3) && S.ranked(t4)
+        # same vocabulary, different merge rule: scores pick xy, ranks pick yz
+        id(t, p) = t.id_of[p]
+        @test S.tokenize(t3, "xyz") == [id(t3, "xy"), id(t3, "z")]
+        @test S.tokenize(t4, "xyz") == [id(t4, "x"), id(t4, "yz")]
+        # a newline run that is a token stays whole
+        @test S.tokenize(t4, "\n\n") == [id(t4, "\n\n")]
+        # BOS is always added for gemma-4, as llama.cpp overrides it
+        meta, _ = InferenceFixtures.spm_vocab_meta(; model = "gemma4")
+        nobos = [k == "tokenizer.ggml.add_bos_token" ? (k => false) : (k => v)
+                 for (k, v) in meta]
+        tnb = S.Tokenizer(Wink.GGUF.GGUFFile(write_gguf(joinpath(dir, "nb.gguf"),
+            nobos, Any[])))
+        @test S.tokenize(tnb, "xyz"; add_special = true)[1] == tnb.bos
+        # llama.cpp's load-time reclassification: end-of-generation pieces
+        # become control whatever the file declares; </s> beside
+        # <|tool_response> becomes text
+        @test t4.types[id(t4, "<turn|>") + 1] == S.T_CONTROL
+        @test t4.types[id(t4, "<|tool_response>") + 1] == S.T_CONTROL
+        @test t4.types[id(t4, "</s>") + 1] == S.T_NORMAL
+        @test !(id(t4, "<turn|>") in S.tokenize(t4, "a<turn|>"; parse_special = false))
+        # merges are mandatory for gemma-4
+        nomerge = filter(kv -> first(kv) != "tokenizer.ggml.merges", meta)
+        bad = Wink.GGUF.GGUFFile(write_gguf(joinpath(dir, "nm.gguf"), nomerge, Any[]))
+        @test_throws ErrorException S.Tokenizer(bad)
     end
 
     @testset "BPE behaviors" begin
