@@ -4,7 +4,8 @@ using Documenter
 DocMeta.setdocmeta!(Wink, :DocTestSetup, :(using Wink); recursive=true)
 
 makedocs(;
-    modules=[Wink],
+    modules=[Wink, Wink.GGUF, Wink.Quant, Wink.SPMTokenizer, Wink.BPETokenizer,
+        Wink.Gemma3, Wink.Gemma4, Wink.OLMoE],
     authors="Josh Ballanco <josh.ballanco@manhattanmetric.com> and contributors",
     sitename="Wink.jl",
     format=Documenter.HTML(;
@@ -17,6 +18,7 @@ makedocs(;
         "Tools" => "tools.md",
         "Safety model" => "safety.md",
         "Configuration" => "configuration.md",
+        "Local models" => "local-models.md",
         "API reference" => "api.md",
     ],
 )

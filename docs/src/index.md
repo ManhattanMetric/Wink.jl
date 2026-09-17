@@ -25,10 +25,10 @@ into your REPL where the model works *inside* your live session:
 
 ```julia
 julia> using Wink
-[Wink] AI mode ready — press ')' at an empty julia> prompt. Chat model: claude-opus-4-8; ...
+[Wink] AI mode ready — press ')' at an empty julia> prompt. Chat model: claude-opus-5; ...
 
 ai> why is my simulate function slow for Float32 inputs?
-  … thinking (claude-opus-4-8)
+  … thinking (claude-opus-5)
   → list_methods(signature="simulate") [0.1s]
   → get_ir(signature="simulate(::Vector{Float32})", level="warntype") [0.8s]
 Your `simulate` hits a type instability: ...
@@ -42,8 +42,10 @@ Run this? [y/N] y
 ```
 
 Provider selection is automatic at load time: `ANTHROPIC_API_KEY` → Claude,
-else `OPENAI_API_KEY` → OpenAI, else a local Ollama server. See
-[Configuration](configuration.md).
+else `OPENAI_API_KEY` → OpenAI, else a local Ollama server. Wink also talks to
+OpenAI-compatible local servers (LM Studio, llama.cpp, vLLM), and can run a
+GGUF model entirely in-process — see [Configuration](configuration.md) and
+[Local models](local-models.md).
 
 Programmatic use works without the REPL mode:
 
@@ -81,4 +83,5 @@ the final answer renders as Markdown. `Ctrl-C` interrupts a turn.
 - [Tools](tools.md) — what the model can do
 - [Safety model](safety.md) — gates, perimeters, and what runs without asking
 - [Configuration](configuration.md) — providers, models, and options
+- [Local models](local-models.md) — in-process inference, no server required
 - [API reference](api.md)
